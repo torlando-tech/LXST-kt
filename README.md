@@ -32,3 +32,12 @@ includeBuild("LXST-kt") {
 ## License
 
 [MPL-2.0](LICENSE)
+
+### Third-party libraries
+
+| Library | License | Link |
+|---------|---------|------|
+| Opus | BSD-3-Clause | [opus-codec.org](https://opus-codec.org) |
+| Codec2 | LGPL-2.1 | [github.com/drowe67/codec2](https://github.com/drowe67/codec2) |
+
+Prebuilt shared libraries (`libopus.so`, `libcodec2.so`) are dynamically linked. JNI wrappers are MIT.
