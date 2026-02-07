@@ -49,8 +49,10 @@ sealed class CallState {
 }
 
 /**
- * Interface for Python call manager interactions.
- * Allows for mocking in unit tests.
+ * Interface for call management actions (call, answer, hangup, mute, speaker).
+ *
+ * Implemented by the transport layer (e.g., PythonWrapperManager or a future
+ * Kotlin Reticulum manager). Allows for mocking in unit tests.
  */
 interface CallController {
     fun call(destinationHash: String)
@@ -65,11 +67,11 @@ interface CallController {
 }
 
 /**
- * Bridge for call state between Python LXST and Kotlin UI.
+ * Bridge for call state between the network transport and the Kotlin UI.
  *
  * Manages bidirectional communication:
- * - Python → Kotlin: Call state changes, incoming calls, call ended
- * - Kotlin → Python: Initiate call, answer, decline, end call, mute, speaker
+ * - Network → UI: Call state changes, incoming calls, call ended
+ * - UI → Network: Initiate call, answer, decline, end call, mute, speaker
  *
  * **Thread Safety**: All state flows are thread-safe. Python callbacks are
  * invoked on the bridge's coroutine scope.
@@ -134,9 +136,9 @@ class CallCoordinator private constructor(
     private val _callStartTime = MutableStateFlow<Long?>(null)
     val callStartTime: StateFlow<Long?> = _callStartTime.asStateFlow()
 
-    // Python call manager reference (set by PythonWrapperManager)
+    // Call controller reference (set by transport layer, e.g. PythonWrapperManager)
     @Volatile
-    private var pythonCallManager: CallController? = null
+    private var callController: CallController? = null
 
     // Callback for incoming calls (for IPC notification to UI process)
     @Volatile
@@ -154,14 +156,14 @@ class CallCoordinator private constructor(
     // ===== Call Manager Setup =====
 
     /**
-     * Set the call manager interface implementation.
+     * Set the call controller implementation.
      *
-     * Called by PythonWrapperManager after initializing the call manager.
-     * Accepts the CallController so `:lxst` has no PyObject dependency.
+     * Called by the transport layer after initialization.
+     * Accepts the CallController so `:lxst` has no transport dependency.
      */
     fun setCallManager(manager: CallController?) {
-        pythonCallManager = manager
-        Log.i(TAG, "CallManager ${if (manager != null) "set" else "cleared"}")
+        callController = manager
+        Log.i(TAG, "CallController ${if (manager != null) "set" else "cleared"}")
     }
 
     /**
@@ -189,12 +191,12 @@ class CallCoordinator private constructor(
         callStateChangedListener = listener
     }
 
-    // ===== Called by Python (via Chaquopy callbacks) =====
+    // ===== Called by network transport =====
 
     /**
      * Notify of incoming call.
      *
-     * Called by Python when LXST receives an incoming call.
+     * Called by the transport layer when an incoming call arrives.
      */
     fun onIncomingCall(identityHash: String) {
         Log.i(TAG, "Incoming call from: ${identityHash.take(16)}...")
@@ -209,7 +211,7 @@ class CallCoordinator private constructor(
     /**
      * Notify that remote is ringing.
      *
-     * Called by Python when outgoing call reaches the remote and they're ringing.
+     * Called by the transport layer when the remote is ringing.
      */
     fun onCallRinging(identityHash: String) {
         Log.d(TAG, "Call ringing: ${identityHash.take(16)}...")
@@ -223,7 +225,7 @@ class CallCoordinator private constructor(
     /**
      * Notify that call is established.
      *
-     * Called by Python when the call is answered and audio is flowing.
+     * Called by the transport layer when the call is answered and audio is flowing.
      */
     fun onCallEstablished(identityHash: String) {
         Log.i(TAG, "Call established with: ${identityHash.take(16)}...")
@@ -238,7 +240,7 @@ class CallCoordinator private constructor(
     /**
      * Notify that call has ended.
      *
-     * Called by Python when the call ends (either side hangs up).
+     * Called by the transport layer when the call ends (either side hangs up).
      */
     fun onCallEnded(identityHash: String?) {
         Log.i(TAG, "Call ended: ${identityHash?.take(16) ?: "unknown"}")
@@ -260,7 +262,7 @@ class CallCoordinator private constructor(
     /**
      * Notify that remote is busy.
      *
-     * Called by Python when the remote party is already on a call.
+     * Called by the transport layer when the remote party is already on a call.
      */
     fun onCallBusy() {
         Log.d(TAG, "Remote is busy")
@@ -276,7 +278,7 @@ class CallCoordinator private constructor(
     /**
      * Notify that call was rejected.
      *
-     * Called by Python when the remote party rejects the call.
+     * Called by the transport layer when the remote party rejects the call.
      */
     fun onCallRejected() {
         Log.d(TAG, "Call rejected")
@@ -304,7 +306,7 @@ class CallCoordinator private constructor(
             _callState.value = CallState.Connecting(destinationHash)
 
             try {
-                pythonCallManager?.call(destinationHash)
+                callController?.call(destinationHash)
             } catch (e: Exception) {
                 Log.e(TAG, "Error initiating call", e)
                 _callState.value = CallState.Ended
@@ -321,7 +323,7 @@ class CallCoordinator private constructor(
         Log.d(TAG, "Answering call")
         scope.launch {
             try {
-                pythonCallManager?.answer()
+                callController?.answer()
             } catch (e: Exception) {
                 Log.e(TAG, "Error answering call", e)
             }
@@ -343,7 +345,7 @@ class CallCoordinator private constructor(
         Log.d(TAG, "Ending call")
         scope.launch {
             try {
-                pythonCallManager?.hangup()
+                callController?.hangup()
             } catch (e: Exception) {
                 Log.e(TAG, "Error ending call", e)
             }
@@ -361,7 +363,7 @@ class CallCoordinator private constructor(
 
         scope.launch {
             try {
-                pythonCallManager?.muteMicrophone(newMuted)
+                callController?.muteMicrophone(newMuted)
             } catch (e: Exception) {
                 Log.e(TAG, "Error toggling mute", e)
             }
@@ -375,7 +377,7 @@ class CallCoordinator private constructor(
         _isMuted.value = muted
         scope.launch {
             try {
-                pythonCallManager?.muteMicrophone(muted)
+                callController?.muteMicrophone(muted)
             } catch (e: Exception) {
                 Log.e(TAG, "Error setting mute", e)
             }
@@ -392,7 +394,7 @@ class CallCoordinator private constructor(
 
         scope.launch {
             try {
-                pythonCallManager?.setSpeaker(newSpeaker)
+                callController?.setSpeaker(newSpeaker)
             } catch (e: Exception) {
                 Log.e(TAG, "Error toggling speaker", e)
             }
@@ -406,7 +408,7 @@ class CallCoordinator private constructor(
         _isSpeakerOn.value = enabled
         scope.launch {
             try {
-                pythonCallManager?.setSpeaker(enabled)
+                callController?.setSpeaker(enabled)
             } catch (e: Exception) {
                 Log.e(TAG, "Error setting speaker", e)
             }

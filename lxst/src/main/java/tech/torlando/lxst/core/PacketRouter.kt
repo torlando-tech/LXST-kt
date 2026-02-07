@@ -20,17 +20,17 @@ import kotlinx.coroutines.launch
 //   AudioDevice, AudioFilters → audio/
 
 /**
- * Low-level coordination layer for packet transfer between Kotlin and Python.
+ * Low-level coordination layer for packet transfer between the audio pipeline
+ * and the network transport.
  *
- * Provides the foundation for Phase 10 network bridge. All packet and signalling
- * traffic flows through this single point.
+ * All packet and signalling traffic flows through this single point.
  *
  * **Threading Model:**
- * - Outbound (Kotlin -> Python): Uses [Dispatchers.IO] coroutine scope to avoid blocking audio thread
- * - Inbound (Python -> Kotlin): Fast callback invocation (Python GIL held, must be quick)
+ * - Outbound (audio pipeline -> network): Uses [Dispatchers.IO] coroutine scope to avoid blocking audio thread
+ * - Inbound (network -> audio pipeline): Fast callback invocation (caller may hold transport locks)
  *
  * **Critical Performance Note:**
- * No synchronous logging in [sendPacket] or [onPythonPacketReceived] methods.
+ * No synchronous logging in [sendPacket] or [onInboundPacket] methods.
  * Logging blocks the audio thread and causes choppiness.
  *
  * @see AudioDevice Reference implementation for singleton pattern
@@ -68,12 +68,12 @@ class PacketRouter private constructor(
         }
     }
 
-    // Dedicated bridge thread for non-blocking Python calls (avoids GIL contention)
+    // Dedicated IO scope for non-blocking transport calls
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Audio packet channel — serializes Kotlin→Python calls to prevent
-    // concurrent GIL acquisition from multiple IO threads.
-    // DROP_OLDEST provides backpressure: if Python can't keep up, old packets are dropped.
+    // Audio packet channel — serializes outbound calls to prevent
+    // concurrent transport access from multiple IO threads.
+    // DROP_OLDEST provides backpressure: if transport can't keep up, old packets are dropped.
     private val packetChannel = Channel<ByteArray>(
         capacity = 4,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -120,13 +120,13 @@ class PacketRouter private constructor(
     @Volatile
     private var onSignalReceived: ((Int) -> Unit)? = null
 
-    // ===== Outbound Methods (Kotlin -> Python) =====
+    // ===== Outbound Methods (audio pipeline -> network) =====
 
     /**
-     * Send encoded audio packet to Python Reticulum.
+     * Send encoded audio packet to the network transport.
      *
      * Called by Packetizer (RemoteSink) when encoded audio frame is ready.
-     * Non-blocking: launches coroutine on [Dispatchers.IO] to avoid blocking audio thread.
+     * Non-blocking: uses buffered channel to avoid blocking audio thread.
      *
      * **CRITICAL:** No Log.d() calls in this method - blocks audio thread.
      *
@@ -137,7 +137,7 @@ class PacketRouter private constructor(
     }
 
     /**
-     * Send signalling to Python Reticulum.
+     * Send signalling to the network transport.
      *
      * Called by SignallingReceiver when signal needs to be sent to remote peer.
      * Non-blocking: launches coroutine on [Dispatchers.IO] to avoid blocking audio thread.
@@ -154,17 +154,17 @@ class PacketRouter private constructor(
         }
     }
 
-    // ===== Inbound Methods (Python -> Kotlin) =====
+    // ===== Inbound Methods (network -> audio pipeline) =====
 
-    // TEMP: Diagnostic counter for inbound packets from Python
+    // TEMP: Diagnostic counter for inbound packets
     @Volatile
     private var inboundPacketCount = 0
 
     /**
-     * Receive encoded packet from Python Reticulum.
+     * Deliver an inbound encoded packet from the network transport.
      *
-     * Called by Python via Chaquopy callback when packet arrives from remote peer.
-     * **MUST BE FAST** - Python GIL is held during this call.
+     * Called by the transport layer when a packet arrives from the remote peer.
+     * **MUST BE FAST** — caller may hold transport-level locks.
      *
      * Simply invokes the registered callback; no processing, no logging.
      * Decoding and mixing happen on the Kotlin audio thread via the callback.
@@ -173,27 +173,27 @@ class PacketRouter private constructor(
      *
      * @param packetData Encoded packet data (codec header byte + encoded frame)
      */
-    fun onPythonPacketReceived(packetData: ByteArray) {
+    fun onInboundPacket(packetData: ByteArray) {
         inboundPacketCount++
         if (inboundPacketCount <= 5 || inboundPacketCount % 100 == 0) {
-            Log.d(TAG, "Inbound RX #$inboundPacketCount (${packetData.size} bytes) cb=${onPacketReceived != null}")
+            Log.d(TAG, "Inbound #$inboundPacketCount (${packetData.size} bytes) cb=${onPacketReceived != null}")
         }
         onPacketReceived?.invoke(packetData)
     }
 
     /**
-     * Receive signalling from Python Reticulum.
+     * Deliver an inbound signal from the network transport.
      *
-     * Called by Python via Chaquopy callback when signal arrives from remote peer.
-     * **MUST BE FAST** - Python GIL is held during this call.
+     * Called by the transport layer when a signal arrives from the remote peer.
+     * **MUST BE FAST** — caller may hold transport-level locks.
      *
      * Note: Debug logging is acceptable here (unlike packet path) because signals
      * are infrequent (state transitions only, not continuous audio).
      *
      * @param signal Signalling value received from remote
      */
-    fun onPythonSignalReceived(signal: Int) {
-        Log.d(TAG, "Signal from Python: 0x${signal.toString(16).padStart(2, '0')}")
+    fun onInboundSignal(signal: Int) {
+        Log.d(TAG, "Inbound signal: 0x${signal.toString(16).padStart(2, '0')}")
         onSignalReceived?.invoke(signal)
     }
 
