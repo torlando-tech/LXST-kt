@@ -8,26 +8,25 @@ import android.content.Context
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.util.Log
-import tech.torlando.lxst.core.AudioDevice
-import tech.torlando.lxst.core.PacketRouter
-import tech.torlando.lxst.audio.LinkSource
-import tech.torlando.lxst.audio.LineSource
-import tech.torlando.lxst.audio.LineSink
-import tech.torlando.lxst.audio.LocalSink
-import tech.torlando.lxst.audio.Mixer
-import tech.torlando.lxst.audio.Packetizer
-import tech.torlando.lxst.audio.Signalling
-import tech.torlando.lxst.audio.Source
-import tech.torlando.lxst.audio.ToneSource
-import tech.torlando.lxst.core.CallCoordinator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import tech.torlando.lxst.audio.LineSink
+import tech.torlando.lxst.audio.LineSource
+import tech.torlando.lxst.audio.LinkSource
+import tech.torlando.lxst.audio.LocalSink
+import tech.torlando.lxst.audio.Mixer
+import tech.torlando.lxst.audio.Packetizer
+import tech.torlando.lxst.audio.Signalling
+import tech.torlando.lxst.audio.Source
+import tech.torlando.lxst.audio.ToneSource
+import tech.torlando.lxst.core.AudioDevice
+import tech.torlando.lxst.core.CallCoordinator
+import tech.torlando.lxst.core.PacketRouter
 
 /**
  * Telephone - Main call lifecycle controller for LXST telephony.
@@ -65,7 +64,7 @@ class Telephone(
     private val networkPacketBridge: PacketRouter,
     private val callBridge: CallCoordinator,
     private val ringTime: Long = RING_TIME_MS,
-    private val waitTime: Long = WAIT_TIME_MS
+    private val waitTime: Long = WAIT_TIME_MS,
 ) {
     companion object {
         private const val TAG = "Columba:Telephone"
@@ -114,7 +113,7 @@ class Telephone(
 
     private var receiveMixer: Mixer? = null
     private var transmitMixer: Mixer? = null
-    private var receiveMixerAsSink: MixerSinkAdapter? = null  // Adapter for sources to push to Mixer
+    private var receiveMixerAsSink: MixerSinkAdapter? = null // Adapter for sources to push to Mixer
     private var transmitMixerAsSink: MixerSinkAdapter? = null // Adapter for sources to push to Mixer
     private var audioInput: LineSource? = null
     private var audioOutput: LineSink? = null
@@ -168,7 +167,10 @@ class Telephone(
      * @param destinationHash 16-byte Reticulum destination hash
      * @param profile Quality profile for the call (default: Profile.MQ)
      */
-    suspend fun call(destinationHash: ByteArray, profile: Profile = Profile.DEFAULT) {
+    suspend fun call(
+        destinationHash: ByteArray,
+        profile: Profile = Profile.DEFAULT,
+    ) {
         if (isCallActive()) {
             Log.w(TAG, "Already in call, ignoring")
             return
@@ -184,19 +186,25 @@ class Telephone(
         // Notify UI
         callBridge.setConnecting(remoteIdentityHash!!)
 
+        // Cancel any stale timeout from a previous call that ended without hangup()
+        // (e.g., link closed → STATUS_AVAILABLE with callStatus=CALLING skips hangup)
+        timeoutJob?.cancel()
+
         // Start outgoing call timeout
-        timeoutJob = scope.launch {
-            delay(waitTime)
-            if (callStatus < Signalling.STATUS_ESTABLISHED) {
-                Log.w(TAG, "Outgoing call timeout after ${waitTime}ms")
-                hangup()
+        timeoutJob =
+            scope.launch {
+                delay(waitTime)
+                if (callStatus < Signalling.STATUS_ESTABLISHED) {
+                    Log.w(TAG, "Outgoing call timeout after ${waitTime}ms")
+                    hangup()
+                }
             }
-        }
 
         // Establish link via NetworkTransport
-        val linkEstablished = withTimeoutOrNull(waitTime) {
-            networkTransport.establishLink(destinationHash)
-        }
+        val linkEstablished =
+            withTimeoutOrNull(waitTime) {
+                networkTransport.establishLink(destinationHash)
+            }
 
         if (linkEstablished != true) {
             Log.w(TAG, "Link establishment failed or timed out")
@@ -215,8 +223,11 @@ class Telephone(
      */
     fun answer(): Boolean {
         if (!isIncomingCall || callStatus != Signalling.STATUS_RINGING) {
-            Log.w(TAG, "Cannot answer: no incoming call or not ringing " +
-                "(isIncoming=$isIncomingCall, status=$callStatus)")
+            Log.w(
+                TAG,
+                "Cannot answer: no incoming call or not ringing " +
+                    "(isIncoming=$isIncomingCall, status=$callStatus)",
+            )
             return false
         }
 
@@ -376,9 +387,7 @@ class Telephone(
     /**
      * Check if there's an active or pending call.
      */
-    fun isCallActive(): Boolean {
-        return callStatus != Signalling.STATUS_AVAILABLE
-    }
+    fun isCallActive(): Boolean = callStatus != Signalling.STATUS_AVAILABLE
 
     // ===== Ringtone Configuration =====
 
@@ -485,7 +494,7 @@ class Telephone(
                     timeoutJob?.cancel()
                     timeoutJob = null
                     disableDialTone()
-                    openPipelines()  // Ensure pipelines created (idempotent)
+                    openPipelines() // Ensure pipelines created (idempotent)
                     startPipelines()
                     callStatus = signal
                     remoteIdentityHash?.let { callBridge.onCallEstablished(it) }
@@ -543,14 +552,16 @@ class Telephone(
         // Notify UI
         callBridge.onIncomingCall(identityHash)
 
-        // Start ring timeout
-        timeoutJob = scope.launch {
-            delay(ringTime)
-            if (callStatus == Signalling.STATUS_RINGING) {
-                Log.w(TAG, "Ring timeout after ${ringTime}ms")
-                hangup()
+        // Start ring timeout (cancel any stale timeout first)
+        timeoutJob?.cancel()
+        timeoutJob =
+            scope.launch {
+                delay(ringTime)
+                if (callStatus == Signalling.STATUS_RINGING) {
+                    Log.w(TAG, "Ring timeout after ${ringTime}ms")
+                    hangup()
+                }
             }
-        }
     }
 
     /**
@@ -587,23 +598,25 @@ class Telephone(
         }
 
         if (receiveMixer == null) {
-            receiveMixer = Mixer(
-                targetFrameMs = activeProfile.frameTimeMs,
-                sink = audioOutput
-            )
+            receiveMixer =
+                Mixer(
+                    targetFrameMs = activeProfile.frameTimeMs,
+                    sink = audioOutput,
+                )
             receiveMixerAsSink = MixerSinkAdapter(receiveMixer!!)
         }
 
         if (dialTone == null) {
-            dialTone = ToneSource(
-                frequency = DIAL_TONE_FREQUENCY,
-                targetGain = 0f, // Start silent
-                ease = true,
-                easeTimeMs = DIAL_TONE_EASE_MS,
-                targetFrameMs = activeProfile.frameTimeMs
-            ).apply {
-                sink = receiveMixerAsSink
-            }
+            dialTone =
+                ToneSource(
+                    frequency = DIAL_TONE_FREQUENCY,
+                    targetGain = 0f, // Start silent
+                    ease = true,
+                    easeTimeMs = DIAL_TONE_EASE_MS,
+                    targetFrameMs = activeProfile.frameTimeMs,
+                ).apply {
+                    sink = receiveMixerAsSink
+                }
         }
     }
 
@@ -615,7 +628,7 @@ class Telephone(
     private fun resetDiallingPipelines() {
         Log.d(TAG, "Resetting dialling pipelines")
 
-        audioOutput?.release()  // release() prevents auto-restart from stale mixer frames
+        audioOutput?.release() // release() prevents auto-restart from stale mixer frames
         dialTone?.stop()
         receiveMixer?.stop()
 
@@ -640,33 +653,36 @@ class Telephone(
 
         // Create packetizer (transmit to network)
         if (packetizer == null) {
-            packetizer = Packetizer(
-                bridge = networkPacketBridge,
-                failureCallback = { onPacketizerFailure() }
-            ).apply {
-                codec = activeProfile.createCodec()
-            }
+            packetizer =
+                Packetizer(
+                    bridge = networkPacketBridge,
+                    failureCallback = { onPacketizerFailure() },
+                ).apply {
+                    codec = activeProfile.createCodec()
+                }
         }
 
         // Create transmit mixer
         if (transmitMixer == null) {
-            transmitMixer = Mixer(
-                targetFrameMs = activeProfile.frameTimeMs,
-                codec = activeProfile.createCodec(),
-                sink = packetizer
-            )
+            transmitMixer =
+                Mixer(
+                    targetFrameMs = activeProfile.frameTimeMs,
+                    codec = activeProfile.createCodec(),
+                    sink = packetizer,
+                )
             transmitMixerAsSink = MixerSinkAdapter(transmitMixer!!)
         }
 
         // Create audio input (microphone)
         if (audioInput == null) {
-            audioInput = LineSource(
-                bridge = audioBridge,
-                codec = activeProfile.createCodec(),
-                targetFrameMs = activeProfile.frameTimeMs
-            ).apply {
-                sink = transmitMixerAsSink
-            }
+            audioInput =
+                LineSource(
+                    bridge = audioBridge,
+                    codec = activeProfile.createCodec(),
+                    targetFrameMs = activeProfile.frameTimeMs,
+                ).apply {
+                    sink = transmitMixerAsSink
+                }
         }
 
         // Create link source (receive from network)
@@ -675,14 +691,15 @@ class Telephone(
             val decodeRate = decodeCodec.preferredSamplerate ?: 48000
             val decodeChannels = decodeCodec.codecChannels
 
-            linkSource = LinkSource(
-                bridge = networkPacketBridge,
-                sink = receiveMixerAsSink
-            ).apply {
-                codec = decodeCodec
-                sampleRate = decodeRate
-                channels = decodeChannels
-            }
+            linkSource =
+                LinkSource(
+                    bridge = networkPacketBridge,
+                    sink = receiveMixerAsSink,
+                ).apply {
+                    codec = decodeCodec
+                    sampleRate = decodeRate
+                    channels = decodeChannels
+                }
 
             // Reconfigure audio output for decode rate and channels. The dial tone
             // may have set LineSink to 48kHz mono; decoded Opus audio may be at a
@@ -752,21 +769,23 @@ class Telephone(
         transmitMixer?.stop()
 
         // Create new transmit mixer with new codec
-        transmitMixer = Mixer(
-            targetFrameMs = activeProfile.frameTimeMs,
-            codec = activeProfile.createCodec(),
-            sink = packetizer
-        )
+        transmitMixer =
+            Mixer(
+                targetFrameMs = activeProfile.frameTimeMs,
+                codec = activeProfile.createCodec(),
+                sink = packetizer,
+            )
         transmitMixerAsSink = MixerSinkAdapter(transmitMixer!!)
 
         // Create new audio input with new codec
-        audioInput = LineSource(
-            bridge = audioBridge,
-            codec = activeProfile.createCodec(),
-            targetFrameMs = activeProfile.frameTimeMs
-        ).apply {
-            sink = transmitMixerAsSink
-        }
+        audioInput =
+            LineSource(
+                bridge = audioBridge,
+                codec = activeProfile.createCodec(),
+                targetFrameMs = activeProfile.frameTimeMs,
+            ).apply {
+                sink = transmitMixerAsSink
+            }
 
         // Update packetizer codec
         packetizer?.codec = activeProfile.createCodec()
@@ -793,20 +812,21 @@ class Telephone(
         Log.d(TAG, "Activating dial tone")
 
         dialToneJob?.cancel()
-        dialToneJob = scope.launch {
-            val windowMs = 7000L
-            val started = System.currentTimeMillis()
+        dialToneJob =
+            scope.launch {
+                val windowMs = 7000L
+                val started = System.currentTimeMillis()
 
-            while (callStatus == Signalling.STATUS_RINGING && !isIncomingCall) {
-                val elapsed = (System.currentTimeMillis() - started) % windowMs
-                if (elapsed > 50 && elapsed < 2050) {
-                    enableDialTone()
-                } else {
-                    muteDialTone()
+                while (callStatus == Signalling.STATUS_RINGING && !isIncomingCall) {
+                    val elapsed = (System.currentTimeMillis() - started) % windowMs
+                    if (elapsed > 50 && elapsed < 2050) {
+                        enableDialTone()
+                    } else {
+                        muteDialTone()
+                    }
+                    delay(200)
                 }
-                delay(200)
             }
-        }
     }
 
     /**
@@ -822,11 +842,12 @@ class Telephone(
             // Use Android RingtoneManager
             scope.launch(Dispatchers.Main) {
                 try {
-                    val uri = if (customRingtonePath != null) {
-                        android.net.Uri.parse(customRingtonePath)
-                    } else {
-                        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                    }
+                    val uri =
+                        if (customRingtonePath != null) {
+                            android.net.Uri.parse(customRingtonePath)
+                        } else {
+                            RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                        }
                     systemRingtone = RingtoneManager.getRingtone(context, uri)
                     systemRingtone?.play()
                     Log.d(TAG, "System ringtone started")
@@ -851,42 +872,45 @@ class Telephone(
         Log.d(TAG, "Playing tone ring pattern")
 
         ringToneJob?.cancel()
-        ringToneJob = scope.launch {
-            // Create ringer pipeline if needed (separate from main call pipeline)
-            if (ringerSink == null) {
-                ringerSink = LineSink(bridge = audioBridge)
-            }
-            if (ringerMixer == null) {
-                ringerMixer = Mixer(
-                    targetFrameMs = 60,
-                    sink = ringerSink
-                )
-            }
-            if (ringTone == null) {
-                val ringerMixerAsSink = MixerSinkAdapter(ringerMixer!!)
-                ringTone = ToneSource(
-                    frequency = DIAL_TONE_FREQUENCY,
-                    targetGain = 0.1f,  // Louder than dial tone for ringtone
-                    ease = true,
-                    easeTimeMs = DIAL_TONE_EASE_MS
-                ).apply {
-                    sink = ringerMixerAsSink
+        ringToneJob =
+            scope.launch {
+                // Create ringer pipeline if needed (separate from main call pipeline)
+                if (ringerSink == null) {
+                    ringerSink = LineSink(bridge = audioBridge)
                 }
-            }
+                if (ringerMixer == null) {
+                    ringerMixer =
+                        Mixer(
+                            targetFrameMs = 60,
+                            sink = ringerSink,
+                        )
+                }
+                if (ringTone == null) {
+                    val ringerMixerAsSink = MixerSinkAdapter(ringerMixer!!)
+                    ringTone =
+                        ToneSource(
+                            frequency = DIAL_TONE_FREQUENCY,
+                            targetGain = 0.1f, // Louder than dial tone for ringtone
+                            ease = true,
+                            easeTimeMs = DIAL_TONE_EASE_MS,
+                        ).apply {
+                            sink = ringerMixerAsSink
+                        }
+                }
 
-            // Ring pattern: 2s on, 4s off (standard telephone ring)
-            while (isIncomingCall && callStatus == Signalling.STATUS_RINGING) {
-                ringerMixer?.start()
-                ringTone?.start()
-                delay(2000)
+                // Ring pattern: 2s on, 4s off (standard telephone ring)
+                while (isIncomingCall && callStatus == Signalling.STATUS_RINGING) {
+                    ringerMixer?.start()
+                    ringTone?.start()
+                    delay(2000)
+                    ringTone?.stop()
+                    delay(4000)
+                }
+
+                // Cleanup when loop exits
                 ringTone?.stop()
-                delay(4000)
+                ringerMixer?.stop()
             }
-
-            // Cleanup when loop exits
-            ringTone?.stop()
-            ringerMixer?.stop()
-        }
     }
 
     /**
@@ -1055,9 +1079,7 @@ class Telephone(
 /**
  * Convert ByteArray to hex string for logging.
  */
-private fun ByteArray.toHexString(): String {
-    return joinToString("") { "%02x".format(it) }
-}
+private fun ByteArray.toHexString(): String = joinToString("") { "%02x".format(it) }
 
 /**
  * Adapter that wraps Mixer to provide Sink interface.
@@ -1072,16 +1094,15 @@ private fun ByteArray.toHexString(): String {
  *
  * @param mixer The Mixer instance to wrap
  */
-class MixerSinkAdapter(private val mixer: Mixer) : LocalSink() {
-
+class MixerSinkAdapter(
+    private val mixer: Mixer,
+) : LocalSink() {
     /**
      * Check if mixer can accept more frames.
      *
      * Delegates to Mixer.canReceive().
      */
-    override fun canReceive(fromSource: Source?): Boolean {
-        return mixer.canReceive(fromSource)
-    }
+    override fun canReceive(fromSource: Source?): Boolean = mixer.canReceive(fromSource)
 
     /**
      * Handle an incoming audio frame.
@@ -1091,7 +1112,10 @@ class MixerSinkAdapter(private val mixer: Mixer) : LocalSink() {
      * @param frame Float32 audio samples
      * @param source Optional source reference
      */
-    override fun handleFrame(frame: FloatArray, source: Source?) {
+    override fun handleFrame(
+        frame: FloatArray,
+        source: Source?,
+    ) {
         mixer.handleFrame(frame, source)
     }
 
@@ -1118,7 +1142,5 @@ class MixerSinkAdapter(private val mixer: Mixer) : LocalSink() {
      *
      * Delegates to Mixer.isRunning().
      */
-    override fun isRunning(): Boolean {
-        return mixer.isRunning()
-    }
+    override fun isRunning(): Boolean = mixer.isRunning()
 }
