@@ -459,6 +459,7 @@ class CallCoordinator private constructor(
      */
     fun setPttActive(active: Boolean) {
         if (!_isPttMode.value) return
+        if (_callState.value !is CallState.Active) return
         Log.d(TAG, "PTT active: $active")
         _isPttActive.value = active
         setMuted(!active) // Pressed = unmuted (transmitting), released = muted (listening)
