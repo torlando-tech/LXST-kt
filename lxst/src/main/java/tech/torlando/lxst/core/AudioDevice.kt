@@ -69,11 +69,10 @@ class AudioDevice(
         /**
          * Get or create singleton instance.
          */
-        fun getInstance(context: Context): AudioDevice {
-            return instance ?: synchronized(this) {
+        fun getInstance(context: Context): AudioDevice =
+            instance ?: synchronized(this) {
                 instance ?: AudioDevice(context.applicationContext).also { instance = it }
             }
-        }
 
         /**
          * Reset singleton instance (for testing).
@@ -154,6 +153,7 @@ class AudioDevice(
         sampleRate: Int,
         channels: Int,
         lowLatency: Boolean,
+        autoPlay: Boolean = true,
     ) {
         if (isPlaying.get()) {
             Log.w(TAG, "Playback already started")
@@ -182,18 +182,20 @@ class AudioDevice(
 
         if (bufferSize <= 0) {
             Log.e(TAG, "Invalid buffer size: $bufferSize")
-            onPlaybackError?.invoke( "Invalid buffer size: $bufferSize")
+            onPlaybackError?.invoke("Invalid buffer size: $bufferSize")
             return
         }
 
         val attributes =
-            AudioAttributes.Builder()
+            AudioAttributes
+                .Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
 
         val format =
-            AudioFormat.Builder()
+            AudioFormat
+                .Builder()
                 .setSampleRate(sampleRate)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setChannelMask(channelConfig)
@@ -201,7 +203,8 @@ class AudioDevice(
 
         try {
             val trackBuilder =
-                AudioTrack.Builder()
+                AudioTrack
+                    .Builder()
                     .setAudioAttributes(attributes)
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(maxOf(bufferSize * 2, sampleRate * channels * 2 * 500 / 1000))
@@ -246,30 +249,40 @@ class AudioDevice(
                 Log.i(TAG, "📞 Available outputs: ${outputs.map { "${it.type}:${it.productName}" }}")
             }
 
-            audioTrack?.play()
-            val playState = audioTrack?.playState
-            Log.i(TAG, "📞 AudioTrack.play() called, playState=$playState (PLAYING=${AudioTrack.PLAYSTATE_PLAYING})")
-            isPlaying.set(true)
-            Log.i(TAG, "Playback started successfully, speaker=${audioManager.isSpeakerphoneOn}")
+            if (autoPlay) {
+                beginPlayback()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start playback", e)
-            onPlaybackError?.invoke( e.message ?: "Unknown error")
+            onPlaybackError?.invoke(e.message ?: "Unknown error")
         }
+    }
+
+    /**
+     * Begin playback on a previously created AudioTrack.
+     *
+     * Call after writing prebuffer data when startPlayback(autoPlay=false).
+     * Data written before play() stays in AudioTrack's internal buffer,
+     * so playback starts with a full prebuffer — no race with DMA consumption.
+     */
+    fun beginPlayback() {
+        audioTrack?.play()
+        val playState = audioTrack?.playState
+        Log.i(TAG, "📞 AudioTrack.play() called, playState=$playState (PLAYING=${AudioTrack.PLAYSTATE_PLAYING})")
+        isPlaying.set(true)
+        Log.i(TAG, "Playback started successfully, speaker=${audioManager.isSpeakerphoneOn}")
     }
 
     /**
      * Write audio data to the output.
      *
      * Data should be PCM 16-bit samples as a byte array.
+     * Supports writes both before play() (prebuffer) and during playback.
      * CRITICAL: No diagnostic scanning or logging on this hot path.
      *
      * @param audioData Raw PCM 16-bit audio bytes
      */
     fun writeAudio(audioData: ByteArray) {
-        if (!isPlaying.get()) {
-            return
-        }
-
         val track = audioTrack ?: return
 
         try {
@@ -292,7 +305,8 @@ class AudioDevice(
      * Stop audio playback.
      */
     fun stopPlayback() {
-        if (!isPlaying.getAndSet(false)) {
+        val wasPlaying = isPlaying.getAndSet(false)
+        if (!wasPlaying && audioTrack == null) {
             return
         }
 
@@ -359,7 +373,7 @@ class AudioDevice(
             Log.i(TAG, "Recording started successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording", e)
-            onRecordingError?.invoke( e.message ?: "Unknown error")
+            onRecordingError?.invoke(e.message ?: "Unknown error")
         }
     }
 
@@ -371,7 +385,7 @@ class AudioDevice(
         val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
         if (bufferSize <= 0) {
             Log.e(TAG, "Invalid buffer size: $bufferSize")
-            onRecordingError?.invoke( "Invalid buffer size: $bufferSize")
+            onRecordingError?.invoke("Invalid buffer size: $bufferSize")
             return null
         }
         return bufferSize
@@ -414,7 +428,7 @@ class AudioDevice(
 
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             Log.e(TAG, "AudioRecord failed to initialize, state=${record.state}")
-            onRecordingError?.invoke( "AudioRecord failed to initialize")
+            onRecordingError?.invoke("AudioRecord failed to initialize")
             record.release()
             return null
         }
@@ -452,13 +466,14 @@ class AudioDevice(
         // Initialize Kotlin-native audio filter chain
         // These replace slow Python/CFFI filters (~20-50ms → <1ms per frame)
         if (filtersEnabled) {
-            filterChain = AudioFilters.VoiceFilterChain(
-                channels = recordChannels,
-                highPassCutoff = 300f,   // Remove low-frequency rumble/hum
-                lowPassCutoff = 3400f,   // Voice band limit
-                agcTargetDb = -12f,      // Target level for AGC
-                agcMaxGain = 12f,        // Max gain boost
-            )
+            filterChain =
+                AudioFilters.VoiceFilterChain(
+                    channels = recordChannels,
+                    highPassCutoff = 300f, // Remove low-frequency rumble/hum
+                    lowPassCutoff = 3400f, // Voice band limit
+                    agcTargetDb = -12f, // Target level for AGC
+                    agcMaxGain = 12f, // Max gain boost
+                )
             Log.i(TAG, "📞 Kotlin filter chain initialized: HP=300Hz LP=3400Hz AGC=-12dB (max +12dB)")
         } else {
             filterChain = null
@@ -656,13 +671,14 @@ class AudioDevice(
         // If recording is active, reinitialize filter chain
         if (isRecording.get()) {
             if (enabled) {
-                filterChain = AudioFilters.VoiceFilterChain(
-                    channels = recordChannels,
-                    highPassCutoff = 300f,
-                    lowPassCutoff = 3400f,
-                    agcTargetDb = -12f,
-                    agcMaxGain = 12f,
-                )
+                filterChain =
+                    AudioFilters.VoiceFilterChain(
+                        channels = recordChannels,
+                        highPassCutoff = 300f,
+                        lowPassCutoff = 3400f,
+                        agcTargetDb = -12f,
+                        agcMaxGain = 12f,
+                    )
                 Log.i(TAG, "📞 Filter chain reinitialized while recording")
             } else {
                 filterChain = null
@@ -737,20 +753,23 @@ class AudioDevice(
             }
 
             val attributes =
-                AudioAttributes.Builder()
+                AudioAttributes
+                    .Builder()
                     .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
 
             val format =
-                AudioFormat.Builder()
+                AudioFormat
+                    .Builder()
                     .setSampleRate(playbackSampleRate)
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setChannelMask(channelConfig)
                     .build()
 
             val trackBuilder =
-                AudioTrack.Builder()
+                AudioTrack
+                    .Builder()
                     .setAudioAttributes(attributes)
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(maxOf(bufferSize * 2, playbackSampleRate * playbackChannels * 2 * 500 / 1000))
@@ -846,14 +865,13 @@ class AudioDevice(
      * Check if speakerphone is enabled.
      */
     @Suppress("DEPRECATION")
-    fun isSpeakerphoneOn(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    fun isSpeakerphoneOn(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val device = audioManager.communicationDevice
             device?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
         } else {
             audioManager.isSpeakerphoneOn
         }
-    }
 
     /**
      * Check if microphone is muted.
