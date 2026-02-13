@@ -47,7 +47,7 @@ class LinkSource(
         private const val TAG = "Columba:LinkSource"
 
         /** Maximum packets in queue before dropping oldest (backpressure) */
-        const val MAX_PACKETS = 8
+        const val MAX_PACKETS = 32
     }
 
     // RemoteSource properties
