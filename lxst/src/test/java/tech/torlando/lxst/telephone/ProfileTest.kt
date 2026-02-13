@@ -5,7 +5,6 @@
 package tech.torlando.lxst.telephone
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -19,7 +18,6 @@ import org.junit.Test
  * Profile IDs must match Python LXST Telephony.py exactly for wire compatibility.
  */
 class ProfileTest {
-
     // ===== Profile IDs (must match Python LXST exactly) =====
 
     @Test
@@ -54,12 +52,12 @@ class ProfileTest {
 
     @Test
     fun `LL has correct ID`() {
-        assertEquals(0x70, Profile.LL.id)
+        assertEquals(0x80, Profile.LL.id)
     }
 
     @Test
     fun `ULL has correct ID`() {
-        assertEquals(0x80, Profile.ULL.id)
+        assertEquals(0x70, Profile.ULL.id)
     }
 
     // ===== Frame Times (ms) =====
@@ -113,11 +111,17 @@ class ProfileTest {
 
     @Test
     fun `profiles are in expected order`() {
-        val expected = listOf(
-            Profile.ULBW, Profile.VLBW, Profile.LBW,
-            Profile.MQ, Profile.HQ, Profile.SHQ,
-            Profile.LL, Profile.ULL
-        )
+        val expected =
+            listOf(
+                Profile.ULBW,
+                Profile.VLBW,
+                Profile.LBW,
+                Profile.MQ,
+                Profile.HQ,
+                Profile.SHQ,
+                Profile.LL,
+                Profile.ULL,
+            )
         assertEquals(expected, Profile.all)
     }
 
@@ -141,7 +145,12 @@ class ProfileTest {
 
     @Test
     fun `fromId returns correct profile for ULL`() {
-        assertEquals(Profile.ULL, Profile.fromId(0x80))
+        assertEquals(Profile.ULL, Profile.fromId(0x70))
+    }
+
+    @Test
+    fun `fromId returns correct profile for LL`() {
+        assertEquals(Profile.LL, Profile.fromId(0x80))
     }
 
     @Test
@@ -236,7 +245,7 @@ class ProfileTest {
         Profile.all.forEach { profile ->
             assertTrue(
                 "${profile.name} abbreviation '${profile.abbreviation}' too long",
-                profile.abbreviation.length <= 4
+                profile.abbreviation.length <= 4,
             )
         }
     }

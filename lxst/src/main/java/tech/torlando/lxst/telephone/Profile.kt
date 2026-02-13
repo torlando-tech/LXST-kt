@@ -15,7 +15,7 @@ import tech.torlando.lxst.codec.Opus
  * Profile IDs are used in signalling and must match Python:
  * - ULBW=0x10, VLBW=0x20, LBW=0x30 (Codec2)
  * - MQ=0x40, HQ=0x50, SHQ=0x60 (Opus standard)
- * - LL=0x70, ULL=0x80 (Opus low-latency)
+ * - ULL=0x70, LL=0x80 (Opus low-latency)
  *
  * Each profile encapsulates codec configuration and frame timing parameters.
  * Profile.createCodec() returns a properly configured codec instance.
@@ -28,7 +28,7 @@ sealed class Profile(
     /** Short abbreviation for UI display */
     val abbreviation: String,
     /** Target frame time in milliseconds */
-    val frameTimeMs: Int
+    val frameTimeMs: Int,
 ) {
     /**
      * Create a codec instance configured for this profile.
@@ -72,6 +72,7 @@ sealed class Profile(
     /** Medium Quality - Opus voice medium (8000 bps, 24kHz) */
     data object MQ : Profile(0x40, "Medium Quality", "MQ", 60) {
         override fun createCodec(): Codec = Opus(profile = Opus.PROFILE_VOICE_MEDIUM)
+
         override fun createDecodeCodec(): Codec = Opus(profile = Opus.PROFILE_VOICE_HIGH)
     }
 
@@ -88,14 +89,16 @@ sealed class Profile(
     // ====== Opus Profiles (Low Latency) ======
 
     /** Low Latency - Opus voice medium with 20ms frames */
-    data object LL : Profile(0x70, "Low Latency", "LL", 20) {
+    data object LL : Profile(0x80, "Low Latency", "LL", 20) {
         override fun createCodec(): Codec = Opus(profile = Opus.PROFILE_VOICE_MEDIUM)
+
         override fun createDecodeCodec(): Codec = Opus(profile = Opus.PROFILE_VOICE_HIGH)
     }
 
     /** Ultra Low Latency - Opus voice medium with 10ms frames */
-    data object ULL : Profile(0x80, "Ultra Low Latency", "ULL", 10) {
+    data object ULL : Profile(0x70, "Ultra Low Latency", "ULL", 10) {
         override fun createCodec(): Codec = Opus(profile = Opus.PROFILE_VOICE_MEDIUM)
+
         override fun createDecodeCodec(): Codec = Opus(profile = Opus.PROFILE_VOICE_HIGH)
     }
 
