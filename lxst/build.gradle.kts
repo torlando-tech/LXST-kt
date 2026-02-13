@@ -9,12 +9,22 @@ android {
     namespace = "tech.torlando.lxst"
     compileSdk = 35
 
+    buildFeatures {
+        prefab = true
+    }
+
     defaultConfig {
         minSdk = 24
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
         ndk {
             abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                arguments += "-DANDROID_STL=c++_shared"
+            }
         }
     }
 
@@ -44,6 +54,9 @@ android {
 }
 
 dependencies {
+    // Native audio (Oboe C++ via Prefab)
+    implementation("com.google.oboe:oboe:1.9.0")
+
     // Coroutines
     implementation(libs.coroutines.core)
     implementation(libs.coroutines.android)

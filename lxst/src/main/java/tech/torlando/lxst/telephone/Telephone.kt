@@ -19,7 +19,10 @@ import tech.torlando.lxst.audio.LineSink
 import tech.torlando.lxst.audio.LineSource
 import tech.torlando.lxst.audio.LinkSource
 import tech.torlando.lxst.audio.LocalSink
+import tech.torlando.lxst.audio.LocalSource
 import tech.torlando.lxst.audio.Mixer
+import tech.torlando.lxst.audio.OboeLineSink
+import tech.torlando.lxst.audio.OboeLineSource
 import tech.torlando.lxst.audio.Packetizer
 import tech.torlando.lxst.audio.Signalling
 import tech.torlando.lxst.audio.Source
@@ -56,6 +59,7 @@ import tech.torlando.lxst.core.PacketRouter
  * @param callBridge CallCoordinator for UI state synchronization
  * @param ringTime Maximum ring time in milliseconds (default 60s)
  * @param waitTime Maximum wait time for outgoing calls in milliseconds (default 70s)
+ * @param useNativePlayback Use Oboe native playback (true) or legacy AudioTrack (false)
  */
 class Telephone(
     private val context: Context,
@@ -65,6 +69,7 @@ class Telephone(
     private val callBridge: CallCoordinator,
     private val ringTime: Long = RING_TIME_MS,
     private val waitTime: Long = WAIT_TIME_MS,
+    private val useNativePlayback: Boolean = true,
 ) {
     companion object {
         private const val TAG = "Columba:Telephone"
@@ -115,8 +120,8 @@ class Telephone(
     private var transmitMixer: Mixer? = null
     private var receiveMixerAsSink: MixerSinkAdapter? = null // Adapter for sources to push to Mixer
     private var transmitMixerAsSink: MixerSinkAdapter? = null // Adapter for sources to push to Mixer
-    private var audioInput: LineSource? = null
-    private var audioOutput: LineSink? = null
+    private var audioInput: LocalSource? = null // LineSource or OboeLineSource (feature flag)
+    private var audioOutput: LocalSink? = null // LineSink or OboeLineSink (feature flag)
     private var linkSource: LinkSource? = null
     private var packetizer: Packetizer? = null
     private var dialTone: ToneSource? = null
@@ -287,7 +292,9 @@ class Telephone(
         transmitMixer = null
         receiveMixerAsSink = null
         transmitMixerAsSink = null
+        releaseAudioInput()
         audioInput = null
+        releaseAudioOutput()
         audioOutput = null
         linkSource = null
         packetizer = null
@@ -594,7 +601,7 @@ class Telephone(
         Log.d(TAG, "Preparing dialling pipelines")
 
         if (audioOutput == null) {
-            audioOutput = LineSink(bridge = audioBridge)
+            audioOutput = if (useNativePlayback) OboeLineSink() else LineSink(bridge = audioBridge)
         }
 
         if (receiveMixer == null) {
@@ -628,7 +635,7 @@ class Telephone(
     private fun resetDiallingPipelines() {
         Log.d(TAG, "Resetting dialling pipelines")
 
-        audioOutput?.release() // release() prevents auto-restart from stale mixer frames
+        releaseAudioOutput() // release() prevents auto-restart from stale mixer frames
         dialTone?.stop()
         receiveMixer?.stop()
 
@@ -675,14 +682,7 @@ class Telephone(
 
         // Create audio input (microphone)
         if (audioInput == null) {
-            audioInput =
-                LineSource(
-                    bridge = audioBridge,
-                    codec = activeProfile.createCodec(),
-                    targetFrameMs = activeProfile.frameTimeMs,
-                ).apply {
-                    sink = transmitMixerAsSink
-                }
+            audioInput = createAudioInput(activeProfile, transmitMixerAsSink)
         }
 
         // Create link source (receive from network)
@@ -707,7 +707,7 @@ class Telephone(
             // AudioTrack is created with the correct config on auto-start.
             audioOutput?.let { sink ->
                 if (sink.isRunning()) sink.stop()
-                sink.configure(decodeRate, decodeChannels)
+                configureAudioOutput(decodeRate, decodeChannels)
             }
         }
 
@@ -778,14 +778,8 @@ class Telephone(
         transmitMixerAsSink = MixerSinkAdapter(transmitMixer!!)
 
         // Create new audio input with new codec
-        audioInput =
-            LineSource(
-                bridge = audioBridge,
-                codec = activeProfile.createCodec(),
-                targetFrameMs = activeProfile.frameTimeMs,
-            ).apply {
-                sink = transmitMixerAsSink
-            }
+        releaseAudioInput()
+        audioInput = createAudioInput(activeProfile, transmitMixerAsSink)
 
         // Update packetizer codec
         packetizer?.codec = activeProfile.createCodec()
@@ -1046,7 +1040,66 @@ class Telephone(
         // Reconfigure audio output for new decode rate
         audioOutput?.let { sink ->
             if (sink.isRunning()) sink.stop()
-            sink.configure(decodeRate, 1)
+            configureAudioOutput(decodeRate, 1)
+        }
+    }
+
+    // ===== Audio Output Helpers (bridge LineSink / OboeLineSink) =====
+
+    /**
+     * Release the audio output sink, regardless of concrete type.
+     */
+    private fun releaseAudioOutput() {
+        when (val sink = audioOutput) {
+            is LineSink -> sink.release()
+            is OboeLineSink -> sink.release()
+            else -> sink?.stop()
+        }
+    }
+
+    /**
+     * Configure the audio output sink for the given sample rate and channels.
+     */
+    private fun configureAudioOutput(
+        sampleRate: Int,
+        channels: Int,
+    ) {
+        when (val sink = audioOutput) {
+            is LineSink -> sink.configure(sampleRate, channels)
+            is OboeLineSink -> sink.configure(sampleRate, channels)
+            else -> {} // No-op for unknown types
+        }
+    }
+
+    /**
+     * Create an audio input source using the appropriate implementation.
+     */
+    private fun createAudioInput(
+        profile: Profile,
+        mixerSink: MixerSinkAdapter?,
+    ): LocalSource =
+        if (useNativePlayback) {
+            OboeLineSource(
+                codec = profile.createCodec(),
+                targetFrameMs = profile.frameTimeMs,
+            ).apply {
+                sink = mixerSink
+            }
+        } else {
+            LineSource(
+                bridge = audioBridge,
+                codec = profile.createCodec(),
+                targetFrameMs = profile.frameTimeMs,
+            ).apply {
+                sink = mixerSink
+            }
+        }
+
+    private fun releaseAudioInput() {
+        when (val source = audioInput) {
+            is LineSource -> source.release()
+            is OboeLineSource -> source.release()
+            else -> source?.stop()
         }
     }
 
