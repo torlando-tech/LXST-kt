@@ -114,4 +114,94 @@ Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeGetXRunCount(
     return sEngine ? sEngine->getXRunCount() : 0;
 }
 
+// --- Phase 3: Native codec JNI methods ---
+
+JNIEXPORT jboolean JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeConfigureDecoder(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/,
+        jint codecType,
+        jint sampleRate,
+        jint channels,
+        jint opusApp,
+        jint opusBitrate,
+        jint opusComplexity,
+        jint codec2Mode) {
+
+    if (!sEngine) {
+        LOGE("nativeConfigureDecoder: engine not created");
+        return JNI_FALSE;
+    }
+
+    return static_cast<jboolean>(
+        sEngine->configureDecoder(codecType, sampleRate, channels,
+                                  opusApp, opusBitrate, opusComplexity,
+                                  codec2Mode));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeWriteEncodedPacket(
+        JNIEnv* env,
+        jobject /*thiz*/,
+        jbyteArray data,
+        jint offset,
+        jint length) {
+
+    if (!sEngine) {
+        LOGE("nativeWriteEncodedPacket: engine not created");
+        return JNI_FALSE;
+    }
+
+    // Use GetByteArrayElements with offset to avoid Kotlin-side copyOfRange
+    jbyte* bytes = env->GetByteArrayElements(data, nullptr);
+    if (!bytes) return JNI_FALSE;
+
+    bool ok = sEngine->writeEncodedPacket(
+        reinterpret_cast<const uint8_t*>(bytes + offset), length);
+
+    env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    return static_cast<jboolean>(ok);
+}
+
+JNIEXPORT void JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeSetPlaybackMute(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/,
+        jboolean mute) {
+
+    if (sEngine) {
+        sEngine->setPlaybackMute(mute);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeDestroyDecoder(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
+    if (sEngine) {
+        sEngine->destroyDecoder();
+    }
+}
+
+// --- Diagnostics ---
+
+JNIEXPORT jint JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeGetCallbackFrameCount(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
+    if (!sEngine) return 0;
+    return sEngine->getCallbackFrameCount();
+}
+
+JNIEXPORT jint JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeGetCallbackSilenceCount(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
+    if (!sEngine) return 0;
+    return sEngine->getCallbackSilenceCount();
+}
+
 } // extern "C"

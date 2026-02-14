@@ -70,6 +70,7 @@ void OboeCaptureEngine::stopStream() {
 
 void OboeCaptureEngine::destroy() {
     stopStream();
+    destroyEncoder();
     ringBuffer_.reset();
     accumBuffer_.reset();
     filterChain_.reset();
@@ -126,15 +127,21 @@ bool OboeCaptureEngine::openStream() {
          stream_->getFramesPerBurst(),
          stream_->getBufferCapacityInFrames());
 
+    // Set isRecording_ BEFORE requestStart() to avoid a race condition:
+    // The SCHED_FIFO callback can fire immediately after requestStart(),
+    // and if isRecording_ is still false, the callback returns Stop,
+    // permanently killing the stream.
+    isRecording_.store(true);
+    accumCount_ = 0;
+
     result = stream_->requestStart();
     if (result != oboe::Result::OK) {
+        isRecording_.store(false);
         LOGE("Failed to start input stream: %s", oboe::convertToText(result));
         closeStream();
         return false;
     }
 
-    isRecording_.store(true);
-    accumCount_ = 0;
     LOGI("Input stream started");
     return true;
 }
@@ -173,17 +180,43 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
         processed += toCopy;
 
         if (accumCount_ == frameSamples_) {
-            // Full LXST frame accumulated — apply filters and write to ring buffer
-            if (filterChain_) {
-                filterChain_->process(accumBuffer_.get(), frameSamples_, sampleRate_);
+            // Full LXST frame accumulated
+
+            // Apply mute: replace with silence if capture is muted
+            int16_t* frameData = accumBuffer_.get();
+            if (captureMuted_.load(std::memory_order_relaxed)) {
+                if (silenceBuf_) {
+                    frameData = silenceBuf_.get();
+                } else {
+                    std::memset(accumBuffer_.get(), 0, sizeof(int16_t) * frameSamples_);
+                }
             }
 
-            if (!ringBuffer_->write(accumBuffer_.get(), frameSamples_)) {
-                // Ring buffer full — drop oldest frame and retry
-                // (Kotlin consumer is too slow; drop stale audio)
-                int16_t discard[1]; // read() just advances the index
-                ringBuffer_->read(discard, frameSamples_);
-                ringBuffer_->write(accumBuffer_.get(), frameSamples_);
+            // Apply filters
+            if (filterChain_) {
+                filterChain_->process(frameData, frameSamples_, sampleRate_);
+            }
+
+            if (encodeInCallback_ && encoder_ && encodedRingBuffer_) {
+                // Phase 3: Encode directly in callback → encoded ring buffer
+                int encodedLen = encoder_->encode(frameData, frameSamples_,
+                                                  encodeBuf_, sizeof(encodeBuf_));
+                if (encodedLen > 0) {
+                    if (!encodedRingBuffer_->write(encodeBuf_, encodedLen)) {
+                        // Encoded ring buffer full — drop (consumer too slow)
+                        uint8_t discard[1];
+                        int discardLen;
+                        encodedRingBuffer_->read(discard, 1, &discardLen);
+                        encodedRingBuffer_->write(encodeBuf_, encodedLen);
+                    }
+                }
+            } else {
+                // Phase 2: Write raw PCM to ring buffer
+                if (!ringBuffer_->write(frameData, frameSamples_)) {
+                    int16_t discard[1];
+                    ringBuffer_->read(discard, frameSamples_);
+                    ringBuffer_->write(frameData, frameSamples_);
+                }
             }
 
             accumCount_ = 0;
@@ -193,6 +226,57 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
     return isRecording_.load(std::memory_order_relaxed)
         ? oboe::DataCallbackResult::Continue
         : oboe::DataCallbackResult::Stop;
+}
+
+// --- Phase 3: Native codec integration ---
+
+bool OboeCaptureEngine::configureEncoder(int codecType, int sampleRate, int channels,
+                                          int opusApp, int opusBitrate, int opusComplexity,
+                                          int codec2Mode) {
+    destroyEncoder();
+
+    encoder_ = std::make_unique<CodecWrapper>();
+    bool ok = false;
+
+    if (codecType == static_cast<int>(CodecType::OPUS)) {
+        ok = encoder_->createOpus(sampleRate, channels, opusApp, opusBitrate, opusComplexity);
+    } else if (codecType == static_cast<int>(CodecType::CODEC2)) {
+        ok = encoder_->createCodec2(codec2Mode);
+    }
+
+    if (!ok) {
+        LOGE("configureEncoder failed: type=%d rate=%d ch=%d", codecType, sampleRate, channels);
+        encoder_.reset();
+        return false;
+    }
+
+    // Encoded ring buffer: 32 slots, 1500 bytes max per slot
+    encodedRingBuffer_ = std::make_unique<EncodedRingBuffer>(32, 1500);
+
+    // Pre-allocate silence buffer for mute
+    silenceBuf_ = std::make_unique<int16_t[]>(frameSamples_);
+    std::memset(silenceBuf_.get(), 0, sizeof(int16_t) * frameSamples_);
+
+    encodeInCallback_ = true;
+
+    LOGI("Encoder configured: type=%d rate=%d ch=%d", codecType, sampleRate, channels);
+    return true;
+}
+
+bool OboeCaptureEngine::readEncodedPacket(uint8_t* dest, int maxLength, int* actualLength) {
+    if (!encodedRingBuffer_) return false;
+    return encodedRingBuffer_->read(dest, maxLength, actualLength);
+}
+
+void OboeCaptureEngine::setCaptureMute(bool mute) {
+    captureMuted_.store(mute, std::memory_order_relaxed);
+}
+
+void OboeCaptureEngine::destroyEncoder() {
+    encodeInCallback_ = false;
+    encoder_.reset();
+    encodedRingBuffer_.reset();
+    silenceBuf_.reset();
 }
 
 // --- Oboe error callback (stream disconnect recovery) ---

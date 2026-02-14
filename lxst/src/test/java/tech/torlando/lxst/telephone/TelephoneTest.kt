@@ -5,10 +5,6 @@
 package tech.torlando.lxst.telephone
 
 import android.content.Context
-import tech.torlando.lxst.core.AudioDevice
-import tech.torlando.lxst.core.PacketRouter
-import tech.torlando.lxst.audio.Signalling
-import tech.torlando.lxst.core.CallCoordinator
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -31,6 +27,10 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import tech.torlando.lxst.audio.Signalling
+import tech.torlando.lxst.core.AudioDevice
+import tech.torlando.lxst.core.CallCoordinator
+import tech.torlando.lxst.core.PacketRouter
 
 /**
  * Unit tests for Telephone configuration and state logic.
@@ -44,7 +44,6 @@ import org.junit.Test
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class TelephoneTest {
-
     private val testDispatcher = StandardTestDispatcher()
 
     private lateinit var mockContext: Context
@@ -74,13 +73,15 @@ class TelephoneTest {
 
         every { mockTransport.isLinkActive } returns false
 
-        telephone = Telephone(
-            context = mockContext,
-            networkTransport = mockTransport,
-            audioBridge = mockAudioBridge,
-            networkPacketBridge = mockPacketRouter,
-            callBridge = mockCallCoordinator
-        )
+        telephone =
+            Telephone(
+                context = mockContext,
+                networkTransport = mockTransport,
+                audioBridge = mockAudioBridge,
+                networkPacketBridge = mockPacketRouter,
+                callBridge = mockCallCoordinator,
+                useNativeCodec = false, // Disable Phase 3 native codec (requires JNI)
+            )
     }
 
     @After
@@ -254,57 +255,61 @@ class TelephoneTest {
     // ===== Call Initiation =====
 
     @Test
-    fun `call method calls establishLink on transport`() = runTest {
-        val destHash = ByteArray(32) { 0x00 }
+    fun `call method calls establishLink on transport`() =
+        runTest {
+            val destHash = ByteArray(32) { 0x00 }
 
-        // Mock link establishment to fail (so we don't go further into call setup)
-        coEvery { mockTransport.establishLink(any()) } returns false
+            // Mock link establishment to fail (so we don't go further into call setup)
+            coEvery { mockTransport.establishLink(any()) } returns false
 
-        telephone.call(destHash)
+            telephone.call(destHash)
 
-        coVerify { mockTransport.establishLink(destHash) }
-    }
+            coVerify { mockTransport.establishLink(destHash) }
+        }
 
     @Test
-    fun `call method accepts profile parameter`() = runTest {
-        val destHash = ByteArray(32) { 0x00 }
+    fun `call method accepts profile parameter`() =
+        runTest {
+            val destHash = ByteArray(32) { 0x00 }
 
-        coEvery { mockTransport.establishLink(any()) } coAnswers {
-            // Profile should be set during call setup
+            coEvery { mockTransport.establishLink(any()) } coAnswers {
+                // Profile should be set during call setup
+                assertEquals(Profile.HQ, telephone.activeProfile)
+                true
+            }
+
+            telephone.call(destHash, Profile.HQ)
+            advanceUntilIdle()
+
+            // Profile persists after successful link establishment
             assertEquals(Profile.HQ, telephone.activeProfile)
-            true
         }
 
-        telephone.call(destHash, Profile.HQ)
-        advanceUntilIdle()
-
-        // Profile persists after successful link establishment
-        assertEquals(Profile.HQ, telephone.activeProfile)
-    }
-
     @Test
-    fun `call sets status to CALLING`() = runTest {
-        val destHash = ByteArray(32) { 0x00 }
+    fun `call sets status to CALLING`() =
+        runTest {
+            val destHash = ByteArray(32) { 0x00 }
 
-        coEvery { mockTransport.establishLink(any()) } coAnswers {
-            // Check status during link establishment
-            assertEquals(Signalling.STATUS_CALLING, telephone.callStatus)
-            false
+            coEvery { mockTransport.establishLink(any()) } coAnswers {
+                // Check status during link establishment
+                assertEquals(Signalling.STATUS_CALLING, telephone.callStatus)
+                false
+            }
+
+            telephone.call(destHash)
         }
 
-        telephone.call(destHash)
-    }
-
     @Test
-    fun `call notifies call bridge of connecting state`() = runTest {
-        val destHash = ByteArray(32) { 0x00 }
+    fun `call notifies call bridge of connecting state`() =
+        runTest {
+            val destHash = ByteArray(32) { 0x00 }
 
-        coEvery { mockTransport.establishLink(any()) } returns false
+            coEvery { mockTransport.establishLink(any()) } returns false
 
-        telephone.call(destHash)
+            telephone.call(destHash)
 
-        verify { mockCallCoordinator.setConnecting(any()) }
-    }
+            verify { mockCallCoordinator.setConnecting(any()) }
+        }
 
     // ===== Hangup =====
 
@@ -315,16 +320,17 @@ class TelephoneTest {
     }
 
     @Test
-    fun `hangup resets call status to AVAILABLE`() = runTest {
-        // Start a call first
-        coEvery { mockTransport.establishLink(any()) } returns false
-        telephone.call(ByteArray(32))
-        advanceUntilIdle()
+    fun `hangup resets call status to AVAILABLE`() =
+        runTest {
+            // Start a call first
+            coEvery { mockTransport.establishLink(any()) } returns false
+            telephone.call(ByteArray(32))
+            advanceUntilIdle()
 
-        telephone.hangup()
+            telephone.hangup()
 
-        assertEquals(Signalling.STATUS_AVAILABLE, telephone.callStatus)
-    }
+            assertEquals(Signalling.STATUS_AVAILABLE, telephone.callStatus)
+        }
 
     @Test
     fun `hangup notifies call bridge`() {
@@ -333,27 +339,29 @@ class TelephoneTest {
     }
 
     @Test
-    fun `hangup resets mute state`() = runTest {
-        telephone.muteTransmit(true)
-        assertTrue(telephone.isTransmitMuted())
+    fun `hangup resets mute state`() =
+        runTest {
+            telephone.muteTransmit(true)
+            assertTrue(telephone.isTransmitMuted())
 
-        telephone.hangup()
+            telephone.hangup()
 
-        assertFalse(telephone.isTransmitMuted())
-    }
+            assertFalse(telephone.isTransmitMuted())
+        }
 
     @Test
-    fun `hangup resets activeProfile to DEFAULT`() = runTest {
-        // Start a call with non-default profile (link succeeds so call stays active)
-        coEvery { mockTransport.establishLink(any()) } returns true
-        telephone.call(ByteArray(32), Profile.SHQ)
-        advanceUntilIdle()
-        assertEquals(Profile.SHQ, telephone.activeProfile)
+    fun `hangup resets activeProfile to DEFAULT`() =
+        runTest {
+            // Start a call with non-default profile (link succeeds so call stays active)
+            coEvery { mockTransport.establishLink(any()) } returns true
+            telephone.call(ByteArray(32), Profile.SHQ)
+            advanceUntilIdle()
+            assertEquals(Profile.SHQ, telephone.activeProfile)
 
-        telephone.hangup()
+            telephone.hangup()
 
-        assertEquals(Profile.DEFAULT, telephone.activeProfile)
-    }
+            assertEquals(Profile.DEFAULT, telephone.activeProfile)
+        }
 
     // ===== Answer =====
 
@@ -367,32 +375,34 @@ class TelephoneTest {
     }
 
     @Test
-    fun `answer when ringing returns true and establishes call`() = runTest {
-        telephone.onIncomingCall("abcd1234")
-        advanceUntilIdle()
+    fun `answer when ringing returns true and establishes call`() =
+        runTest {
+            telephone.onIncomingCall("abcd1234")
+            advanceUntilIdle()
 
-        val result = telephone.answer()
+            val result = telephone.answer()
 
-        assertTrue(result)
-        assertEquals(Signalling.STATUS_ESTABLISHED, telephone.callStatus)
-        verify { mockTransport.sendSignal(Signalling.STATUS_ESTABLISHED) }
-        verify { mockCallCoordinator.onCallEstablished("abcd1234") }
-    }
+            assertTrue(result)
+            assertEquals(Signalling.STATUS_ESTABLISHED, telephone.callStatus)
+            verify { mockTransport.sendSignal(Signalling.STATUS_ESTABLISHED) }
+            verify { mockCallCoordinator.onCallEstablished("abcd1234") }
+        }
 
     @Test
-    fun `answer sends profile preference before established`() = runTest {
-        telephone.onIncomingCall("abcd1234")
-        advanceUntilIdle()
+    fun `answer sends profile preference before established`() =
+        runTest {
+            telephone.onIncomingCall("abcd1234")
+            advanceUntilIdle()
 
-        telephone.answer()
+            telephone.answer()
 
-        // Profile preference should be sent BEFORE STATUS_ESTABLISHED
-        val expectedProfileSignal = Signalling.PREFERRED_PROFILE + Profile.DEFAULT.id
-        verifyOrder {
-            mockTransport.sendSignal(expectedProfileSignal)
-            mockTransport.sendSignal(Signalling.STATUS_ESTABLISHED)
+            // Profile preference should be sent BEFORE STATUS_ESTABLISHED
+            val expectedProfileSignal = Signalling.PREFERRED_PROFILE + Profile.DEFAULT.id
+            verifyOrder {
+                mockTransport.sendSignal(expectedProfileSignal)
+                mockTransport.sendSignal(Signalling.STATUS_ESTABLISHED)
+            }
         }
-    }
 
     // ===== prepareForAnswer (JIT state setup) =====
 
@@ -413,53 +423,58 @@ class TelephoneTest {
     }
 
     @Test
-    fun `prepareForAnswer when already in call is ignored`() = runTest {
-        telephone.onIncomingCall("first1234")
-        advanceUntilIdle()
+    fun `prepareForAnswer when already in call is ignored`() =
+        runTest {
+            telephone.onIncomingCall("first1234")
+            advanceUntilIdle()
 
-        telephone.prepareForAnswer("second5678")
-        // Should still be on first call
-        assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
-    }
+            telephone.prepareForAnswer("second5678")
+            // Should still be on first call
+            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+        }
 
     // ===== Incoming Call =====
 
     @Test
-    fun `onIncomingCall sets status to RINGING`() = runTest {
-        telephone.onIncomingCall("abcd1234")
-        advanceUntilIdle()
-        assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
-    }
+    fun `onIncomingCall sets status to RINGING`() =
+        runTest {
+            telephone.onIncomingCall("abcd1234")
+            advanceUntilIdle()
+            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+        }
 
     @Test
-    fun `onIncomingCall notifies call bridge`() = runTest {
-        telephone.onIncomingCall("abcd1234")
-        advanceUntilIdle()
-        verify { mockCallCoordinator.onIncomingCall("abcd1234") }
-    }
+    fun `onIncomingCall notifies call bridge`() =
+        runTest {
+            telephone.onIncomingCall("abcd1234")
+            advanceUntilIdle()
+            verify { mockCallCoordinator.onIncomingCall("abcd1234") }
+        }
 
     @Test
-    fun `onIncomingCall does not send RINGING to transport (Python handles it)`() = runTest {
-        telephone.onIncomingCall("abcd1234")
-        advanceUntilIdle()
-        // Python call_manager sends STATUS_RINGING to remote before calling
-        // Telephone.onIncomingCall(), so Kotlin should not send it again
-        verify(exactly = 0) { mockTransport.sendSignal(Signalling.STATUS_RINGING) }
-    }
+    fun `onIncomingCall does not send RINGING to transport (Python handles it)`() =
+        runTest {
+            telephone.onIncomingCall("abcd1234")
+            advanceUntilIdle()
+            // Python call_manager sends STATUS_RINGING to remote before calling
+            // Telephone.onIncomingCall(), so Kotlin should not send it again
+            verify(exactly = 0) { mockTransport.sendSignal(Signalling.STATUS_RINGING) }
+        }
 
     @Test
-    fun `onIncomingCall when already in call signals BUSY`() = runTest {
-        // First incoming call
-        telephone.onIncomingCall("first1234")
-        advanceUntilIdle()
+    fun `onIncomingCall when already in call signals BUSY`() =
+        runTest {
+            // First incoming call
+            telephone.onIncomingCall("first1234")
+            advanceUntilIdle()
 
-        // Second incoming call while first is active
-        telephone.onIncomingCall("second5678")
-        advanceUntilIdle()
+            // Second incoming call while first is active
+            telephone.onIncomingCall("second5678")
+            advanceUntilIdle()
 
-        // Should signal busy to second caller
-        verify { mockTransport.sendSignal(Signalling.STATUS_BUSY) }
-    }
+            // Should signal busy to second caller
+            verify { mockTransport.sendSignal(Signalling.STATUS_BUSY) }
+        }
 
     // ===== Signal Handling =====
 
@@ -470,11 +485,12 @@ class TelephoneTest {
     }
 
     @Test
-    fun `STATUS_RINGING signal updates call status`() = runTest {
-        signalCallback?.invoke(Signalling.STATUS_RINGING)
-        advanceUntilIdle()
-        assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
-    }
+    fun `STATUS_RINGING signal updates call status`() =
+        runTest {
+            signalCallback?.invoke(Signalling.STATUS_RINGING)
+            advanceUntilIdle()
+            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+        }
 
     @Test
     fun `STATUS_CONNECTING signal updates call status`() {
@@ -595,31 +611,34 @@ class TelephoneTest {
     // ===== isCallActive logic =====
 
     @Test
-    fun `isCallActive returns true when status is CALLING`() = runTest {
-        coEvery { mockTransport.establishLink(any()) } coAnswers {
-            // During link establishment, status should be CALLING
-            assertTrue(telephone.isCallActive())
-            false
+    fun `isCallActive returns true when status is CALLING`() =
+        runTest {
+            coEvery { mockTransport.establishLink(any()) } coAnswers {
+                // During link establishment, status should be CALLING
+                assertTrue(telephone.isCallActive())
+                false
+            }
+
+            telephone.call(ByteArray(32))
         }
 
-        telephone.call(ByteArray(32))
-    }
+    @Test
+    fun `isCallActive returns true when status is RINGING`() =
+        runTest {
+            telephone.onIncomingCall("test1234")
+            advanceUntilIdle()
+            assertTrue(telephone.isCallActive())
+        }
 
     @Test
-    fun `isCallActive returns true when status is RINGING`() = runTest {
-        telephone.onIncomingCall("test1234")
-        advanceUntilIdle()
-        assertTrue(telephone.isCallActive())
-    }
+    fun `isCallActive returns false after hangup`() =
+        runTest {
+            telephone.onIncomingCall("test1234")
+            advanceUntilIdle()
+            assertTrue(telephone.isCallActive())
 
-    @Test
-    fun `isCallActive returns false after hangup`() = runTest {
-        telephone.onIncomingCall("test1234")
-        advanceUntilIdle()
-        assertTrue(telephone.isCallActive())
+            telephone.hangup()
 
-        telephone.hangup()
-
-        assertFalse(telephone.isCallActive())
-    }
+            assertFalse(telephone.isCallActive())
+        }
 }

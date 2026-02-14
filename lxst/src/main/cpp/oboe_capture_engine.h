@@ -10,6 +10,8 @@
 #include <memory>
 #include "packet_ring_buffer.h"
 #include "native_audio_filters.h"
+#include "codec_wrapper.h"
+#include "encoded_ring_buffer.h"
 
 /**
  * Oboe-based audio capture engine for LXST.
@@ -73,6 +75,40 @@ public:
     /** Cumulative xrun count from the Oboe stream. */
     int getXRunCount() const;
 
+    // --- Phase 3: Native codec integration ---
+
+    /**
+     * Configure a native encoder on the capture engine.
+     *
+     * When configured, the Oboe callback encodes directly after filtering,
+     * writing encoded packets to an EncodedRingBuffer. Kotlin reads via
+     * readEncodedPacket() instead of readSamples().
+     */
+    bool configureEncoder(int codecType, int sampleRate, int channels,
+                          int opusApp, int opusBitrate, int opusComplexity,
+                          int codec2Mode);
+
+    /**
+     * Read one encoded packet from the encoded ring buffer.
+     *
+     * @param dest      Destination buffer
+     * @param maxLength Size of destination buffer
+     * @param actualLength [out] Actual bytes read
+     * @return true if a packet was read, false if buffer empty
+     */
+    bool readEncodedPacket(uint8_t* dest, int maxLength, int* actualLength);
+
+    /**
+     * Set capture mute state.
+     *
+     * When muted, the callback encodes silence so the remote side still
+     * receives packets (prevents jitter buffer underrun).
+     */
+    void setCaptureMute(bool mute);
+
+    /** Destroy the native encoder, freeing codec resources. */
+    void destroyEncoder();
+
     // --- Oboe callbacks ---
 
     oboe::DataCallbackResult onAudioReady(
@@ -99,6 +135,18 @@ private:
 
     std::atomic<bool> isCreated_{false};
     std::atomic<bool> isRecording_{false};
+
+    // Phase 3: Native codec encoder
+    std::unique_ptr<CodecWrapper> encoder_;
+    std::unique_ptr<EncodedRingBuffer> encodedRingBuffer_;
+    std::unique_ptr<int16_t[]> monoToStereoBuf_;  // For SHQ stereo upmix
+    std::atomic<bool> captureMuted_{false};
+    bool encodeInCallback_ = false;  // True when encoder is configured
+
+    // Pre-allocated encode output buffer (max Opus output ~1275 bytes)
+    uint8_t encodeBuf_[1500];
+    // Pre-allocated silence buffer for mute
+    std::unique_ptr<int16_t[]> silenceBuf_;
 };
 
 #endif // LXST_OBOE_CAPTURE_ENGINE_H

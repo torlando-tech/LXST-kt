@@ -12,6 +12,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import tech.torlando.lxst.codec.Codec
+import tech.torlando.lxst.core.PacketRouter
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.ceil
 
@@ -54,8 +55,35 @@ class OboeLineSource(
         const val MAX_FRAMES = 15
     }
 
-    /** Sink to push captured frames to (set by Telephone/Pipeline) */
+    /** Sink to push captured frames to (set by Telephone/Pipeline) — Phase 2 path */
     var sink: Sink? = null
+
+    /**
+     * Phase 3: When true, read encoded packets from native encoder instead of
+     * raw PCM. Bypasses transmit Mixer and Packetizer entirely.
+     */
+    @Volatile
+    var useNativeCodec: Boolean = false
+
+    /** Phase 3: PacketRouter to send encoded packets directly to Python */
+    var packetRouter: PacketRouter? = null
+
+    /** Phase 3: Codec header byte to prepend to encoded packets */
+    var codecHeaderByte: Byte = Packetizer.CODEC_OPUS
+
+    /**
+     * Phase 3: Native encoder params to configure after native engine creation.
+     *
+     * Must be set before start(). The encoder is configured in start() after
+     * NativeCaptureEngine.create() succeeds, ensuring the C++ singleton exists.
+     */
+    var nativeEncoderCodecType: Int = 0
+    var nativeEncoderSampleRate: Int = 0
+    var nativeEncoderChannels: Int = 0
+    var nativeEncoderOpusApp: Int = 0
+    var nativeEncoderOpusBitrate: Int = 0
+    var nativeEncoderOpusComplexity: Int = 10
+    var nativeEncoderCodec2Mode: Int = 0
 
     // Audio configuration (derived from codec, same as LineSource)
     override var sampleRate: Int = DEFAULT_SAMPLE_RATE
@@ -122,6 +150,21 @@ class OboeLineSource(
             }
         }
 
+        // Phase 3: Configure native encoder now that the C++ engine exists
+        if (useNativeCodec && nativeEncoderCodecType > 0) {
+            val configured =
+                NativeCaptureEngine.configureEncoder(
+                    codecType = nativeEncoderCodecType,
+                    sampleRate = nativeEncoderSampleRate,
+                    channels = nativeEncoderChannels,
+                    opusApp = nativeEncoderOpusApp,
+                    opusBitrate = nativeEncoderOpusBitrate,
+                    opusComplexity = nativeEncoderOpusComplexity,
+                    codec2Mode = nativeEncoderCodec2Mode,
+                )
+            Log.i(TAG, "Native encoder configured: $configured (type=$nativeEncoderCodecType rate=$nativeEncoderSampleRate)")
+        }
+
         // Start Oboe input stream
         val started = NativeCaptureEngine.startStream()
         if (!started) {
@@ -161,14 +204,26 @@ class OboeLineSource(
     // --- Internal ---
 
     /**
-     * Main consumer loop — reads filtered frames from native ring buffer.
+     * Main consumer loop — reads from native ring buffer and pushes downstream.
      *
      * Runs on Dispatchers.IO. The native Oboe callback (SCHED_FIFO) is the
      * producer; this coroutine is the consumer. The lock-free SPSC ring buffer
      * ensures zero contention between threads.
+     *
+     * Phase 2: Reads raw PCM → float32 → gain → transmit Mixer
+     * Phase 3: Reads encoded packets → prepend header → PacketRouter → Python
      */
     private suspend fun ingestJob() {
-        Log.d(TAG, "Ingest job started")
+        if (useNativeCodec) {
+            ingestJobNativeCodec()
+        } else {
+            ingestJobPcm()
+        }
+    }
+
+    /** Phase 2: Read raw PCM, convert to float32, push to Mixer */
+    private suspend fun ingestJobPcm() {
+        Log.d(TAG, "Ingest job started (PCM mode)")
         val shortBuffer = ShortArray(samplesPerFrame)
         var frameCount = 0L
 
@@ -176,10 +231,8 @@ class OboeLineSource(
             if (NativeCaptureEngine.readSamples(shortBuffer)) {
                 frameCount++
 
-                // Convert int16 → float32
                 val floatSamples = shortToFloat32(shortBuffer)
 
-                // Apply gain if not unity
                 val gained =
                     if (gain != 1.0f) {
                         FloatArray(floatSamples.size) { i -> floatSamples[i] * gain }
@@ -187,7 +240,6 @@ class OboeLineSource(
                         floatSamples
                     }
 
-                // Push to sink (transmit Mixer)
                 val currentSink = sink
                 if (currentSink != null && currentSink.canReceive(this)) {
                     currentSink.handleFrame(gained, this)
@@ -199,12 +251,41 @@ class OboeLineSource(
                     Log.d(TAG, "ingestJob #$frameCount, buf=${NativeCaptureEngine.getBufferedFrameCount()}")
                 }
             } else {
-                // Ring buffer empty — brief yield to avoid busy-spin
                 delay(2)
             }
         }
 
-        Log.d(TAG, "Ingest job ended, captured $frameCount frames")
+        Log.d(TAG, "Ingest job ended (PCM), captured $frameCount frames")
+    }
+
+    /** Phase 3: Read encoded packets, prepend header, send via PacketRouter */
+    private suspend fun ingestJobNativeCodec() {
+        Log.d(TAG, "Ingest job started (native codec mode)")
+        val encodedBuf = ByteArray(1500) // Pre-allocated, reused each iteration
+        var frameCount = 0L
+
+        while (isRunningFlag.get() && !releasedFlag.get()) {
+            val len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len > 0) {
+                frameCount++
+
+                // Prepend codec header byte and send (1 allocation per frame)
+                val packet = ByteArray(1 + len)
+                packet[0] = codecHeaderByte
+                encodedBuf.copyInto(packet, 1, 0, len)
+                packetRouter?.sendPacket(packet)
+
+                if (frameCount <= 5L) {
+                    Log.d(TAG, "TX native #$frameCount: ${packet.size} bytes, hdr=0x${(codecHeaderByte.toInt() and 0xFF).toString(16)}")
+                } else if (frameCount % 100L == 0L) {
+                    Log.d(TAG, "TX native #$frameCount")
+                }
+            } else {
+                delay(2)
+            }
+        }
+
+        Log.d(TAG, "Ingest job ended (native codec), sent $frameCount frames")
     }
 
     /**

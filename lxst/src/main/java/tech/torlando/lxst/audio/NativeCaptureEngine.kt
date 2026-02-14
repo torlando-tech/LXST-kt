@@ -85,6 +85,59 @@ object NativeCaptureEngine {
     /** Cumulative xrun count from the Oboe input stream. */
     fun getXRunCount(): Int = nativeGetXRunCount()
 
+    // --- Phase 3: Native codec methods ---
+
+    /**
+     * Configure a native encoder on the capture engine.
+     *
+     * When configured, the Oboe callback encodes directly after filtering.
+     * Use readEncodedPacket() instead of readSamples() to get encoded output.
+     */
+    fun configureEncoder(
+        codecType: Int,
+        sampleRate: Int,
+        channels: Int,
+        opusApp: Int = 0,
+        opusBitrate: Int = 0,
+        opusComplexity: Int = 10,
+        codec2Mode: Int = 0,
+    ): Boolean {
+        ensureLoaded()
+        return nativeConfigureEncoder(
+            codecType,
+            sampleRate,
+            channels,
+            opusApp,
+            opusBitrate,
+            opusComplexity,
+            codec2Mode,
+        )
+    }
+
+    /**
+     * Read one encoded packet from the native encoded ring buffer.
+     *
+     * @param dest ByteArray to fill with encoded data
+     * @return Number of bytes read, or 0 if buffer is empty
+     */
+    fun readEncodedPacket(dest: ByteArray): Int = nativeReadEncodedPacket(dest)
+
+    /**
+     * Set capture mute state.
+     *
+     * When muted, callback encodes silence so remote still receives packets.
+     */
+    fun setCaptureMute(mute: Boolean) {
+        ensureLoaded()
+        nativeSetCaptureMute(mute)
+    }
+
+    /** Destroy the native encoder, freeing codec resources. */
+    fun destroyEncoder() {
+        ensureLoaded()
+        nativeDestroyEncoder()
+    }
+
     // --- JNI native methods ---
 
     private external fun nativeCreate(
@@ -108,4 +161,21 @@ object NativeCaptureEngine {
     private external fun nativeIsRecording(): Boolean
 
     private external fun nativeGetXRunCount(): Int
+
+    // Phase 3: Native codec JNI methods
+    private external fun nativeConfigureEncoder(
+        codecType: Int,
+        sampleRate: Int,
+        channels: Int,
+        opusApp: Int,
+        opusBitrate: Int,
+        opusComplexity: Int,
+        codec2Mode: Int,
+    ): Boolean
+
+    private external fun nativeReadEncodedPacket(dest: ByteArray): Int
+
+    private external fun nativeSetCaptureMute(mute: Boolean)
+
+    private external fun nativeDestroyEncoder()
 }

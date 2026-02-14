@@ -76,12 +76,16 @@ void OboePlaybackEngine::stopStream() {
 
 void OboePlaybackEngine::destroy() {
     stopStream();
+    destroyDecoder();
     ringBuffer_.reset();
     callbackBuffer_.reset();
     dropBuffer_.reset();
     callbackBufferOffset_ = 0;
     callbackBufferValid_ = 0;
     isCreated_.store(false);
+    decodedFrameCount_.store(0, std::memory_order_relaxed);
+    callbackFrameCount_.store(0, std::memory_order_relaxed);
+    callbackSilenceCount_.store(0, std::memory_order_relaxed);
     LOGI("Destroyed");
 }
 
@@ -129,14 +133,20 @@ bool OboePlaybackEngine::openStream() {
     auto burstSize = stream_->getFramesPerBurst();
     stream_->setBufferSizeInFrames(burstSize * 2);
 
+    // Set isPlaying_ BEFORE requestStart() to avoid a race condition:
+    // The SCHED_FIFO callback can fire immediately after requestStart(),
+    // and if isPlaying_ is still false, the callback returns Stop,
+    // permanently killing the stream.
+    isPlaying_.store(true);
+
     result = stream_->requestStart();
     if (result != oboe::Result::OK) {
+        isPlaying_.store(false);
         LOGE("Failed to start stream: %s", oboe::convertToText(result));
         closeStream();
         return false;
     }
 
-    isPlaying_.store(true);
     LOGI("Stream started");
     return true;
 }
@@ -158,8 +168,17 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
         int32_t numFrames) {
 
     auto* output = static_cast<int16_t*>(audioData);
-    int32_t samplesWritten = 0;
     int32_t totalSamples = numFrames * channels_;
+
+    // Phase 3: Mute outputs silence, ring buffer continues accumulating
+    if (playbackMuted_.load(std::memory_order_relaxed)) {
+        std::memset(output, 0, sizeof(int16_t) * totalSamples);
+        return isPlaying_.load(std::memory_order_relaxed)
+            ? oboe::DataCallbackResult::Continue
+            : oboe::DataCallbackResult::Stop;
+    }
+
+    int32_t samplesWritten = 0;
 
     // Fill the output buffer from LXST frames.
     //
@@ -194,6 +213,7 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
             // Output has room for a full LXST frame — read directly into output
             if (ringBuffer_->read(output + samplesWritten, frameSamples_)) {
                 samplesWritten += frameSamples_;
+                callbackFrameCount_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 break;  // Ring buffer empty
             }
@@ -207,6 +227,7 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
                 samplesWritten += remaining;
                 callbackBufferOffset_ = remaining;
                 callbackBufferValid_ = frameSamples_;
+                callbackFrameCount_.fetch_add(1, std::memory_order_relaxed);
             } else {
                 break;  // Ring buffer empty
             }
@@ -217,11 +238,93 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
     if (samplesWritten < totalSamples) {
         std::memset(output + samplesWritten, 0,
                    sizeof(int16_t) * (totalSamples - samplesWritten));
+        if (samplesWritten == 0) {
+            callbackSilenceCount_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     return isPlaying_.load(std::memory_order_relaxed)
         ? oboe::DataCallbackResult::Continue
         : oboe::DataCallbackResult::Stop;
+}
+
+// --- Phase 3: Native codec integration ---
+
+bool OboePlaybackEngine::configureDecoder(int codecType, int sampleRate, int channels,
+                                           int opusApp, int opusBitrate, int opusComplexity,
+                                           int codec2Mode) {
+    destroyDecoder();
+
+    decoder_ = std::make_unique<CodecWrapper>();
+    bool ok = false;
+
+    if (codecType == static_cast<int>(CodecType::OPUS)) {
+        ok = decoder_->createOpus(sampleRate, channels, opusApp, opusBitrate, opusComplexity);
+    } else if (codecType == static_cast<int>(CodecType::CODEC2)) {
+        ok = decoder_->createCodec2(codec2Mode);
+    }
+
+    if (!ok) {
+        LOGE("configureDecoder failed: type=%d rate=%d ch=%d", codecType, sampleRate, channels);
+        decoder_.reset();
+        return false;
+    }
+
+    // Pre-allocate decode output buffer.
+    // Opus: max 60ms × sampleRate × channels (handles stereo)
+    // Codec2: frame times up to 400ms, but always mono — use frameSamples_
+    decodeBufSize_ = std::max((sampleRate * 60 / 1000) * channels, frameSamples_);
+    decodeBuf_ = std::make_unique<int16_t[]>(decodeBufSize_);
+
+    LOGI("Decoder configured: type=%d rate=%d ch=%d bufSize=%d",
+         codecType, sampleRate, channels, decodeBufSize_);
+    return true;
+}
+
+bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
+    if (!decoder_ || !ringBuffer_ || !decodeBuf_) return false;
+
+    int decodedSamples = decoder_->decode(data, length,
+                                          decodeBuf_.get(), decodeBufSize_);
+    if (decodedSamples <= 0) {
+        static int errCount = 0;
+        if (++errCount <= 5) {
+            LOGW("writeEncodedPacket: decode returned %d (len=%d bufSize=%d)",
+                 decodedSamples, length, decodeBufSize_);
+        }
+        return false;
+    }
+
+    // Sanity check: decoded sample count must match ring buffer frame size
+    if (decodedSamples != frameSamples_) {
+        static int mismatchCount = 0;
+        if (++mismatchCount <= 5) {
+            LOGW("writeEncodedPacket: decoded %d samples but frameSamples=%d (mismatch #%d)",
+                 decodedSamples, frameSamples_, mismatchCount);
+        }
+    }
+
+    int count = decodedFrameCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 5 || count % 50 == 0) {
+        int buf = ringBuffer_->availableFrames();
+        int cb = callbackFrameCount_.load(std::memory_order_relaxed);
+        int sil = callbackSilenceCount_.load(std::memory_order_relaxed);
+        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d",
+             count, decodedSamples, length, buf, cb, sil);
+    }
+
+    // Write decoded PCM into the existing ring buffer
+    return writeSamples(decodeBuf_.get(), decodedSamples);
+}
+
+void OboePlaybackEngine::setPlaybackMute(bool mute) {
+    playbackMuted_.store(mute, std::memory_order_relaxed);
+}
+
+void OboePlaybackEngine::destroyDecoder() {
+    decoder_.reset();
+    decodeBuf_.reset();
+    decodeBufSize_ = 0;
 }
 
 // --- Oboe error callback (stream disconnect recovery) ---

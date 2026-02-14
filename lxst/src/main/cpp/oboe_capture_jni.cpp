@@ -115,4 +115,74 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeGetXRunCount(
     return sCaptureEngine ? sCaptureEngine->getXRunCount() : 0;
 }
 
+// --- Phase 3: Native codec JNI methods ---
+
+JNIEXPORT jboolean JNICALL
+Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeConfigureEncoder(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/,
+        jint codecType,
+        jint sampleRate,
+        jint channels,
+        jint opusApp,
+        jint opusBitrate,
+        jint opusComplexity,
+        jint codec2Mode) {
+
+    if (!sCaptureEngine) {
+        LOGE("nativeConfigureEncoder: engine not created");
+        return JNI_FALSE;
+    }
+
+    return static_cast<jboolean>(
+        sCaptureEngine->configureEncoder(codecType, sampleRate, channels,
+                                         opusApp, opusBitrate, opusComplexity,
+                                         codec2Mode));
+}
+
+JNIEXPORT jint JNICALL
+Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeReadEncodedPacket(
+        JNIEnv* env,
+        jobject /*thiz*/,
+        jbyteArray dest) {
+
+    if (!sCaptureEngine) {
+        LOGE("nativeReadEncodedPacket: engine not created");
+        return 0;
+    }
+
+    jint maxLen = env->GetArrayLength(dest);
+    jbyte* data = env->GetByteArrayElements(dest, nullptr);
+    if (!data) return 0;
+
+    int actualLength = 0;
+    bool ok = sCaptureEngine->readEncodedPacket(
+        reinterpret_cast<uint8_t*>(data), maxLen, &actualLength);
+
+    // Copy back on success, discard on failure
+    env->ReleaseByteArrayElements(dest, data, ok ? 0 : JNI_ABORT);
+    return ok ? actualLength : 0;
+}
+
+JNIEXPORT void JNICALL
+Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeSetCaptureMute(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/,
+        jboolean mute) {
+
+    if (sCaptureEngine) {
+        sCaptureEngine->setCaptureMute(mute);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeDestroyEncoder(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
+    if (sCaptureEngine) {
+        sCaptureEngine->destroyEncoder();
+    }
+}
+
 } // extern "C"

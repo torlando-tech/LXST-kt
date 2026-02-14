@@ -9,6 +9,7 @@
 #include <atomic>
 #include <memory>
 #include "packet_ring_buffer.h"
+#include "codec_wrapper.h"
 
 /**
  * Oboe-based playback engine for LXST audio pipeline.
@@ -96,6 +97,59 @@ public:
     /** Cumulative underrun (xrun) count from the Oboe stream. */
     int getXRunCount() const;
 
+    /** Frames read from ring buffer by the Oboe callback. */
+    int getCallbackFrameCount() const { return callbackFrameCount_.load(std::memory_order_relaxed); }
+
+    /** Callbacks that output full silence (ring buffer empty). */
+    int getCallbackSilenceCount() const { return callbackSilenceCount_.load(std::memory_order_relaxed); }
+
+    // --- Phase 3: Native codec integration ---
+
+    /**
+     * Configure a native decoder for the playback path.
+     *
+     * When configured, writeEncodedPacket() decodes directly in native code,
+     * eliminating JNI crossings and Kotlin allocations on the RX path.
+     *
+     * @param codecType    1=Opus, 2=Codec2
+     * @param sampleRate   Decoder sample rate
+     * @param channels     Number of channels
+     * @param opusApp      Opus application type (ignored for Codec2)
+     * @param opusBitrate  Opus bitrate (ignored for Codec2)
+     * @param opusComplexity Opus complexity (ignored for Codec2)
+     * @param codec2Mode   Codec2 library mode (ignored for Opus)
+     * @return true on success
+     */
+    bool configureDecoder(int codecType, int sampleRate, int channels,
+                          int opusApp, int opusBitrate, int opusComplexity,
+                          int codec2Mode);
+
+    /**
+     * Write an encoded packet directly into the engine.
+     *
+     * Decodes to int16 PCM using the native decoder, then writes decoded
+     * samples into the existing PCM ring buffer. Called from LinkSource's
+     * processing loop on Dispatchers.IO.
+     *
+     * @param data    Encoded packet bytes (without codec header byte)
+     * @param length  Encoded packet length
+     * @return true on success
+     */
+    bool writeEncodedPacket(const uint8_t* data, int length);
+
+    /**
+     * Set playback mute state.
+     *
+     * When muted, the Oboe callback outputs silence but the ring buffer
+     * continues accumulating decoded frames (preserves prebuffer state).
+     *
+     * @param mute True to mute playback output
+     */
+    void setPlaybackMute(bool mute);
+
+    /** Destroy the native decoder, freeing codec resources. */
+    void destroyDecoder();
+
     // --- Oboe callbacks (called on SCHED_FIFO thread) ---
 
     oboe::DataCallbackResult onAudioReady(
@@ -135,6 +189,17 @@ private:
     // Must NOT share callbackBuffer_ since that holds persistent partial frame state
     // accessed by the callback thread.
     std::unique_ptr<int16_t[]> dropBuffer_;
+
+    // Phase 3: Native codec decoder
+    std::unique_ptr<CodecWrapper> decoder_;
+    std::unique_ptr<int16_t[]> decodeBuf_;     // Pre-allocated decode output buffer
+    int decodeBufSize_ = 0;                     // Size of decodeBuf_ in samples
+    std::atomic<bool> playbackMuted_{false};
+
+    // Diagnostics
+    std::atomic<int> decodedFrameCount_{0};   // Frames decoded via writeEncodedPacket
+    std::atomic<int> callbackFrameCount_{0};  // Frames served to Oboe callback
+    std::atomic<int> callbackSilenceCount_{0}; // Callbacks that output silence (underrun)
 };
 
 #endif // LXST_OBOE_PLAYBACK_ENGINE_H
