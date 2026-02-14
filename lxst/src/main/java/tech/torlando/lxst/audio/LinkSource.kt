@@ -48,8 +48,29 @@ class LinkSource(
         /** Maximum packets in queue before dropping oldest (backpressure) */
         const val MAX_PACKETS = 32
 
-        /** Decoded frames to accumulate before starting the Oboe stream (Phase 3). */
-        const val NATIVE_PREBUFFER_FRAMES = 5
+        /** Minimum prebuffer frames (floor for any profile). */
+        const val MIN_PREBUFFER_FRAMES = 5
+
+        /**
+         * Target prebuffer time in milliseconds.
+         *
+         * Used by [computePrebufferFrames] to calculate the number of decoded
+         * frames to accumulate before auto-starting the Oboe playback stream.
+         * Must be large enough to absorb Reticulum network jitter (~100-150ms)
+         * plus Oboe startup latency.
+         */
+        const val PREBUFFER_TARGET_MS = 300
+
+        /**
+         * Compute the prebuffer frame count for a given profile frame time.
+         *
+         * Returns at least [MIN_PREBUFFER_FRAMES] frames, targeting
+         * [PREBUFFER_TARGET_MS] of buffered audio. For profiles with large
+         * frames (MQ: 60ms → 5 frames = 300ms) this matches the old fixed
+         * value. For low-latency profiles (ULL: 10ms → 30 frames = 300ms)
+         * this provides adequate jitter absorption.
+         */
+        fun computePrebufferFrames(frameTimeMs: Int): Int = maxOf(MIN_PREBUFFER_FRAMES, PREBUFFER_TARGET_MS / frameTimeMs)
     }
 
     // RemoteSource properties
@@ -82,8 +103,19 @@ class LinkSource(
     var useNativeCodec: Boolean = false
 
     /**
+     * Number of decoded frames to accumulate before auto-starting the Oboe stream.
+     *
+     * Set by Telephone based on the active profile's frame time via
+     * [computePrebufferFrames]. Low-latency profiles (ULL: 10ms) need many
+     * more frames (30) than standard profiles (MQ: 60ms → 5) to achieve
+     * the same ~300ms of jitter absorption.
+     */
+    @Volatile
+    var prebufferFrames: Int = MIN_PREBUFFER_FRAMES
+
+    /**
      * Phase 3: When true, auto-start the native playback stream after
-     * [NATIVE_PREBUFFER_FRAMES] decoded frames have accumulated in the ring buffer.
+     * [prebufferFrames] decoded frames have accumulated in the ring buffer.
      *
      * Mirrors the Phase 2 pattern where OboeLineSink defers startStream() until
      * the buffer has enough data to prevent callback starvation.
@@ -162,10 +194,10 @@ class LinkSource(
                 // the ring buffer has enough data to prevent callback starvation.
                 if (deferPlaybackStart && !playbackStarted.get()) {
                     val buffered = NativePlaybackEngine.getBufferedFrameCount()
-                    if (buffered >= NATIVE_PREBUFFER_FRAMES) {
+                    if (buffered >= prebufferFrames) {
                         if (playbackStarted.compareAndSet(false, true)) {
                             val started = NativePlaybackEngine.startStream()
-                            Log.i(TAG, "Auto-started native playback: prebuf=$buffered, ok=$started")
+                            Log.i(TAG, "Auto-started native playback: prebuf=$buffered/$prebufferFrames, ok=$started")
                         }
                     }
                 }

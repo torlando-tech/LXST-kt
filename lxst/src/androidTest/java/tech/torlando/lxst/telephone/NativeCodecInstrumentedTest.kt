@@ -15,8 +15,10 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import tech.torlando.lxst.audio.LinkSource
 import tech.torlando.lxst.audio.NativeCaptureEngine
 import tech.torlando.lxst.audio.NativePlaybackEngine
+import tech.torlando.lxst.audio.OboeLineSink
 import tech.torlando.lxst.codec.Codec
 import tech.torlando.lxst.codec.Codec2
 import tech.torlando.lxst.codec.Opus
@@ -1058,5 +1060,232 @@ class NativeCodecInstrumentedTest {
         Thread.sleep(600)
 
         NativePlaybackEngine.destroyDecoder()
+    }
+
+    // =====================================================================
+    //  PREBUFFER: Low-latency profiles need time-based prebuffer
+    // =====================================================================
+
+    /**
+     * Helper to set up a native playback engine with decoder for a profile.
+     *
+     * @return The Kotlin encoder codec (for generating test packets)
+     */
+    private fun createDecoderEngine(
+        profile: Profile,
+        prebufferFrames: Int,
+    ): Codec {
+        val encCodec = trackCodec(profile.createCodec())
+        val decParams = profile.nativeDecodeParams()
+        val decodedFrameSamples =
+            decParams.sampleRate * profile.frameTimeMs / 1000 * decParams.channels
+
+        val created =
+            NativePlaybackEngine.create(
+                sampleRate = decParams.sampleRate,
+                channels = decParams.channels,
+                frameSamples = decodedFrameSamples,
+                maxBufferFrames = OboeLineSink.MAX_QUEUE_SLOTS,
+                prebufferFrames = prebufferFrames,
+            )
+        assertTrue("Engine should create for ${profile.abbreviation}", created)
+        playbackEngineCreated = true
+
+        val configured =
+            NativePlaybackEngine.configureDecoder(
+                codecType = decParams.codecType,
+                sampleRate = decParams.sampleRate,
+                channels = decParams.channels,
+                opusApp = decParams.opusApplication,
+                opusBitrate = decParams.opusBitrate,
+                opusComplexity = decParams.opusComplexity,
+                codec2Mode = decParams.codec2LibraryMode,
+            )
+        assertTrue("Decoder should configure for ${profile.abbreviation}", configured)
+
+        return encCodec
+    }
+
+    /**
+     * Helper to encode and write a frame to the native playback engine.
+     */
+    private fun writeEncodedFrame(
+        encCodec: Codec,
+        profile: Profile,
+    ) {
+        val encRate = encCodec.preferredSamplerate!!
+        val encChannels = encCodec.codecChannels
+        val pcm = generateSineFrame(encRate, encChannels, profile.frameTimeMs)
+        val encoded = encCodec.encode(pcm)
+        NativePlaybackEngine.writeEncodedPacket(encoded, 0, encoded.size)
+    }
+
+    /**
+     * Regression test: ULL with only 5-frame prebuffer (50ms) drains instantly.
+     *
+     * Bug: LinkSource used a fixed NATIVE_PREBUFFER_FRAMES = 5 for all profiles.
+     * For ULL (10ms frames), 5 frames = 50ms of prebuffer:
+     *
+     *   - Oboe burst at 48kHz = 960 samples = 20ms (2 ULL frames per burst)
+     *   - 5 frames = 2400 samples = 2.5 bursts = 50ms of audio
+     *   - After 50ms, the callback has exhausted all data → silence
+     *   - Real logs showed 59-68% silence (cbSilence=70-104 over 50 frames)
+     *
+     * Deterministic test: pre-load only 5 frames, start stream, write nothing
+     * more. The callback drains 50ms of audio in ~50ms, then outputs silence
+     * for the remaining 450ms → >80% silence.
+     */
+    @Test
+    fun ull_lowPrebuffer_drainsInstantly() {
+        sinePhase = 0.0
+        val enc = createDecoderEngine(Profile.ULL, prebufferFrames = 5)
+
+        // Pre-load exactly 5 ULL frames (50ms of audio)
+        repeat(5) { writeEncodedFrame(enc, Profile.ULL) }
+
+        // Start stream — don't write any more data
+        val started = NativePlaybackEngine.startStream()
+        assertTrue("Stream should start", started)
+
+        // Wait 500ms — only 50ms of data exists, rest is silence
+        Thread.sleep(500)
+
+        val cbServed = NativePlaybackEngine.getCallbackFrameCount()
+        val cbSilence = NativePlaybackEngine.getCallbackSilenceCount()
+        val total = cbServed + cbSilence
+
+        val silencePercent = if (total > 0) 100 * cbSilence / total else 0
+
+        // 50ms data + 450ms silence ≈ 90% silence. Assert >70% for margin.
+        assertTrue(
+            "ULL with 5-frame prebuffer (50ms) should drain instantly when no " +
+                "new data arrives. cbServed=$cbServed, cbSilence=$cbSilence " +
+                "($silencePercent%). Expected >70% silence.",
+            silencePercent > 70,
+        )
+
+        NativePlaybackEngine.destroyDecoder()
+    }
+
+    /**
+     * Fix verification: ULL with 30-frame prebuffer (300ms) — pre-loaded data
+     * plays with minimal silence.
+     *
+     * Fix: LinkSource.computePrebufferFrames(10ms) = max(5, 300/10) = 30 frames.
+     *
+     * This is the same pattern as nativeDecoder_prebuffer_preventsExcessiveSilence
+     * but specifically for ULL (10ms frames). Pre-loads all data, verifies the
+     * Oboe callback serves it without starving.
+     */
+    @Test
+    fun ull_adequatePrebuffer_preloaded_minimalSilence() {
+        sinePhase = 0.0
+        val prebufferFrames = LinkSource.computePrebufferFrames(Profile.ULL.frameTimeMs)
+        // Should be max(5, 300/10) = 30
+        val framesToLoad = 50 // 500ms of ULL audio
+
+        val enc = createDecoderEngine(Profile.ULL, prebufferFrames = prebufferFrames)
+
+        // Pre-load ALL frames (500ms) — no real-time pacing
+        repeat(framesToLoad) { writeEncodedFrame(enc, Profile.ULL) }
+
+        val preStartBuf = NativePlaybackEngine.getBufferedFrameCount()
+        assertTrue(
+            "Should have $framesToLoad frames buffered, got $preStartBuf",
+            preStartBuf >= framesToLoad - 1,
+        )
+
+        val started = NativePlaybackEngine.startStream()
+        assertTrue("Stream should start", started)
+
+        // Wait for ~60% of audio to play (300ms of 500ms)
+        Thread.sleep(300)
+
+        val cbServed = NativePlaybackEngine.getCallbackFrameCount()
+        val cbSilence = NativePlaybackEngine.getCallbackSilenceCount()
+
+        // All data pre-loaded → callback should serve with minimal silence.
+        // ULL: 480 samples/frame, Oboe burst ≈ 960 samples → 2 frames per burst.
+        // In 300ms: ~15 bursts = ~30 frames consumed. Pre-loaded 50 → no starvation.
+        assertTrue(
+            "ULL pre-loaded: cbServed=$cbServed, cbSilence=$cbSilence. " +
+                "Expected cbSilence <= 3 (startup transients only).",
+            cbSilence <= 3,
+        )
+
+        assertTrue(
+            "ULL callback should have consumed at least 10 frames in 300ms. " +
+                "Got cbServed=$cbServed.",
+            cbServed >= 10,
+        )
+
+        Thread.sleep(400)
+        NativePlaybackEngine.destroyDecoder()
+    }
+
+    /**
+     * Fix verification: LL with 15-frame prebuffer (300ms) — pre-loaded data
+     * plays with minimal silence.
+     *
+     * LL (20ms frames): computePrebufferFrames(20) = max(5, 300/20) = 15 frames.
+     * Pre-loads 30 LL frames (600ms), verifies smooth playback.
+     */
+    @Test
+    fun ll_adequatePrebuffer_preloaded_minimalSilence() {
+        sinePhase = 0.0
+        val prebufferFrames = LinkSource.computePrebufferFrames(Profile.LL.frameTimeMs)
+        // Should be max(5, 300/20) = 15
+        val framesToLoad = 30 // 600ms of LL audio
+
+        val enc = createDecoderEngine(Profile.LL, prebufferFrames = prebufferFrames)
+
+        // Pre-load ALL frames (600ms)
+        repeat(framesToLoad) { writeEncodedFrame(enc, Profile.LL) }
+
+        val started = NativePlaybackEngine.startStream()
+        assertTrue("Stream should start", started)
+
+        // Wait for ~60% of audio to play (360ms of 600ms)
+        Thread.sleep(360)
+
+        val cbServed = NativePlaybackEngine.getCallbackFrameCount()
+        val cbSilence = NativePlaybackEngine.getCallbackSilenceCount()
+
+        // LL: 960 samples/frame = 1 frame per Oboe burst.
+        // In 360ms: ~18 bursts = ~18 frames. Pre-loaded 30 → no starvation.
+        assertTrue(
+            "LL pre-loaded: cbServed=$cbServed, cbSilence=$cbSilence. " +
+                "Expected cbSilence <= 3.",
+            cbSilence <= 3,
+        )
+
+        assertTrue(
+            "LL callback should have consumed at least 10 frames in 360ms. " +
+                "Got cbServed=$cbServed.",
+            cbServed >= 10,
+        )
+
+        Thread.sleep(400)
+        NativePlaybackEngine.destroyDecoder()
+    }
+
+    /**
+     * Verify computePrebufferFrames gives correct values for all profiles.
+     */
+    @Test
+    fun computePrebufferFrames_timeBased_allProfiles() {
+        // Standard profiles (60ms): 300/60 = 5, max(5,5) = 5
+        assertEquals(5, LinkSource.computePrebufferFrames(Profile.MQ.frameTimeMs))
+        assertEquals(5, LinkSource.computePrebufferFrames(Profile.HQ.frameTimeMs))
+        assertEquals(5, LinkSource.computePrebufferFrames(Profile.SHQ.frameTimeMs))
+
+        // Low-latency profiles
+        assertEquals(15, LinkSource.computePrebufferFrames(Profile.LL.frameTimeMs)) // 300/20 = 15
+        assertEquals(30, LinkSource.computePrebufferFrames(Profile.ULL.frameTimeMs)) // 300/10 = 30
+
+        // Codec2 profiles (long frames): floor clamps to 5
+        assertEquals(5, LinkSource.computePrebufferFrames(Profile.ULBW.frameTimeMs)) // 300/400 = 0 → 5
+        assertEquals(5, LinkSource.computePrebufferFrames(Profile.VLBW.frameTimeMs)) // 300/320 = 0 → 5
+        assertEquals(5, LinkSource.computePrebufferFrames(Profile.LBW.frameTimeMs)) // 300/200 = 1 → 5
     }
 }

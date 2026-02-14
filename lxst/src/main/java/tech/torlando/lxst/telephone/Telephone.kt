@@ -773,12 +773,14 @@ class Telephone(
             // NativePlaybackEngine.create() safely destroys any stale engine first.
             val decodedFrameSamples =
                 decodeParams.sampleRate * activeProfile.frameTimeMs / 1000 * decodeParams.channels
+            val prebufferFrames = LinkSource.computePrebufferFrames(activeProfile.frameTimeMs)
+            Log.d(TAG, "Prebuffer: $prebufferFrames frames × ${activeProfile.frameTimeMs}ms = ${prebufferFrames * activeProfile.frameTimeMs}ms")
             NativePlaybackEngine.create(
                 sampleRate = decodeParams.sampleRate,
                 channels = decodeParams.channels,
                 frameSamples = decodedFrameSamples,
                 maxBufferFrames = OboeLineSink.MAX_QUEUE_SLOTS,
-                prebufferFrames = OboeLineSink.AUTOSTART_MIN,
+                prebufferFrames = prebufferFrames,
             )
             NativePlaybackEngine.configureDecoder(
                 codecType = decodeParams.codecType,
@@ -805,6 +807,7 @@ class Telephone(
                 ).apply {
                     useNativeCodec = true
                     deferPlaybackStart = true
+                    this.prebufferFrames = prebufferFrames
                     // Codec/sink/sampleRate unused in native mode — decode is in C++
                 }
         }
