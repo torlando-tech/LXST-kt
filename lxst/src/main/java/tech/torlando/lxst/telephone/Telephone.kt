@@ -19,7 +19,12 @@ import tech.torlando.lxst.audio.LineSink
 import tech.torlando.lxst.audio.LineSource
 import tech.torlando.lxst.audio.LinkSource
 import tech.torlando.lxst.audio.LocalSink
+import tech.torlando.lxst.audio.LocalSource
 import tech.torlando.lxst.audio.Mixer
+import tech.torlando.lxst.audio.NativeCaptureEngine
+import tech.torlando.lxst.audio.NativePlaybackEngine
+import tech.torlando.lxst.audio.OboeLineSink
+import tech.torlando.lxst.audio.OboeLineSource
 import tech.torlando.lxst.audio.Packetizer
 import tech.torlando.lxst.audio.Signalling
 import tech.torlando.lxst.audio.Source
@@ -56,6 +61,8 @@ import tech.torlando.lxst.core.PacketRouter
  * @param callBridge CallCoordinator for UI state synchronization
  * @param ringTime Maximum ring time in milliseconds (default 60s)
  * @param waitTime Maximum wait time for outgoing calls in milliseconds (default 70s)
+ * @param useNativePlayback Use Oboe native playback (true) or legacy AudioTrack (false)
+ * @param useNativeCodec Use native C++ Opus/Codec2 (true) or Kotlin codec (false). Requires useNativePlayback.
  */
 class Telephone(
     private val context: Context,
@@ -65,6 +72,8 @@ class Telephone(
     private val callBridge: CallCoordinator,
     private val ringTime: Long = RING_TIME_MS,
     private val waitTime: Long = WAIT_TIME_MS,
+    private val useNativePlayback: Boolean = true,
+    private val useNativeCodec: Boolean = true,
 ) {
     companion object {
         private const val TAG = "Columba:Telephone"
@@ -115,8 +124,8 @@ class Telephone(
     private var transmitMixer: Mixer? = null
     private var receiveMixerAsSink: MixerSinkAdapter? = null // Adapter for sources to push to Mixer
     private var transmitMixerAsSink: MixerSinkAdapter? = null // Adapter for sources to push to Mixer
-    private var audioInput: LineSource? = null
-    private var audioOutput: LineSink? = null
+    private var audioInput: LocalSource? = null // LineSource or OboeLineSource (feature flag)
+    private var audioOutput: LocalSink? = null // LineSink or OboeLineSink (feature flag)
     private var linkSource: LinkSource? = null
     private var packetizer: Packetizer? = null
     private var dialTone: ToneSource? = null
@@ -282,12 +291,22 @@ class Telephone(
         stopRingTone()
         disableDialTone()
 
+        // Destroy native codecs and engine (safe no-op if not configured)
+        if (useNativeCodec && useNativePlayback) {
+            NativePlaybackEngine.destroyDecoder()
+            NativePlaybackEngine.stopStream()
+            NativePlaybackEngine.destroy()
+            NativeCaptureEngine.destroyEncoder()
+        }
+
         // Clear pipeline references
         receiveMixer = null
         transmitMixer = null
         receiveMixerAsSink = null
         transmitMixerAsSink = null
+        releaseAudioInput()
         audioInput = null
+        releaseAudioOutput()
         audioOutput = null
         linkSource = null
         packetizer = null
@@ -358,7 +377,13 @@ class Telephone(
     fun muteTransmit(mute: Boolean = true) {
         Log.d(TAG, "Transmit mute: $mute")
         transmitMuted = mute
-        transmitMixer?.mute(mute)
+        if (useNativeCodec && useNativePlayback) {
+            // Phase 3: mute in native capture engine (encodes silence)
+            NativeCaptureEngine.setCaptureMute(mute)
+        } else {
+            // Phase 2: mute via Kotlin transmit mixer
+            transmitMixer?.mute(mute)
+        }
     }
 
     /**
@@ -371,7 +396,13 @@ class Telephone(
     fun muteReceive(mute: Boolean = true) {
         Log.d(TAG, "Receive mute: $mute")
         receiveMuted = mute
-        receiveMixer?.mute(mute)
+        if (useNativeCodec && useNativePlayback) {
+            // Phase 3: mute in native playback engine (outputs silence)
+            NativePlaybackEngine.setPlaybackMute(mute)
+        } else {
+            // Phase 2: mute via Kotlin receive mixer
+            receiveMixer?.mute(mute)
+        }
     }
 
     /**
@@ -594,7 +625,7 @@ class Telephone(
         Log.d(TAG, "Preparing dialling pipelines")
 
         if (audioOutput == null) {
-            audioOutput = LineSink(bridge = audioBridge)
+            audioOutput = if (useNativePlayback) OboeLineSink() else LineSink(bridge = audioBridge)
         }
 
         if (receiveMixer == null) {
@@ -628,7 +659,7 @@ class Telephone(
     private fun resetDiallingPipelines() {
         Log.d(TAG, "Resetting dialling pipelines")
 
-        audioOutput?.release() // release() prevents auto-restart from stale mixer frames
+        releaseAudioOutput() // release() prevents auto-restart from stale mixer frames
         dialTone?.stop()
         receiveMixer?.stop()
 
@@ -644,13 +675,35 @@ class Telephone(
      * Open full audio pipelines for call.
      *
      * Matches Python __open_pipelines() (lines 596-624).
+     *
+     * When [useNativeCodec] is true (Phase 3), codec encode/decode happens in C++:
+     * - RX: LinkSource → NativePlaybackEngine.writeEncodedPacket() → native decode → speaker
+     * - TX: Oboe callback → native encode → OboeLineSource.readEncodedPacket() → Python
+     * The Kotlin Mixers and Packetizer are still created for dial tone (Phase 2 path)
+     * but are bypassed during ESTABLISHED calls when native codec is active.
      */
     private fun openPipelines() {
-        Log.d(TAG, "Opening audio pipelines")
+        Log.d(TAG, "Opening audio pipelines (nativeCodec=$useNativeCodec)")
 
         // Ensure dialling pipelines exist
         prepareDiallingPipelines()
 
+        if (useNativeCodec && useNativePlayback) {
+            openPipelinesNativeCodec()
+        } else {
+            openPipelinesPhase2()
+        }
+
+        // Signal connecting to remote (for incoming calls)
+        if (isIncomingCall) {
+            networkTransport.sendSignal(Signalling.STATUS_CONNECTING)
+        }
+    }
+
+    /**
+     * Phase 2 pipeline: Kotlin codec encode/decode through Mixers.
+     */
+    private fun openPipelinesPhase2() {
         // Create packetizer (transmit to network)
         if (packetizer == null) {
             packetizer =
@@ -675,14 +728,7 @@ class Telephone(
 
         // Create audio input (microphone)
         if (audioInput == null) {
-            audioInput =
-                LineSource(
-                    bridge = audioBridge,
-                    codec = activeProfile.createCodec(),
-                    targetFrameMs = activeProfile.frameTimeMs,
-                ).apply {
-                    sink = transmitMixerAsSink
-                }
+            audioInput = createAudioInput(activeProfile, transmitMixerAsSink)
         }
 
         // Create link source (receive from network)
@@ -701,19 +747,94 @@ class Telephone(
                     channels = decodeChannels
                 }
 
-            // Reconfigure audio output for decode rate and channels. The dial tone
-            // may have set LineSink to 48kHz mono; decoded Opus audio may be at a
-            // different rate or stereo (e.g., SHQ profile). Stop and reconfigure so
-            // AudioTrack is created with the correct config on auto-start.
+            // Reconfigure audio output for decode rate and channels
             audioOutput?.let { sink ->
                 if (sink.isRunning()) sink.stop()
-                sink.configure(decodeRate, decodeChannels)
+                configureAudioOutput(decodeRate, decodeChannels)
             }
         }
+    }
 
-        // Signal connecting to remote (for incoming calls)
-        if (isIncomingCall) {
-            networkTransport.sendSignal(Signalling.STATUS_CONNECTING)
+    /**
+     * Phase 3 pipeline: Native C++ codec encode/decode, bypassing Kotlin Mixers.
+     *
+     * RX: LinkSource pushes encoded packets to NativePlaybackEngine (native decode → speaker)
+     * TX: NativeCaptureEngine encodes in callback, OboeLineSource reads encoded → Python
+     */
+    private fun openPipelinesNativeCodec() {
+        val encodeParams = activeProfile.nativeEncodeParams()
+        val decodeParams = activeProfile.nativeDecodeParams()
+
+        // --- RX: Configure native decoder on playback engine ---
+        if (linkSource == null) {
+            // Ensure native playback engine exists with decoded frame parameters.
+            // On caller side, the dial tone may have already created it (via OboeLineSink),
+            // but on callee side (answer path), no audio has played yet.
+            // NativePlaybackEngine.create() safely destroys any stale engine first.
+            val decodedFrameSamples =
+                decodeParams.sampleRate * activeProfile.frameTimeMs / 1000 * decodeParams.channels
+            val prebufferFrames = LinkSource.computePrebufferFrames(activeProfile.frameTimeMs)
+            Log.d(TAG, "Prebuffer: $prebufferFrames frames × ${activeProfile.frameTimeMs}ms = ${prebufferFrames * activeProfile.frameTimeMs}ms")
+            NativePlaybackEngine.create(
+                sampleRate = decodeParams.sampleRate,
+                channels = decodeParams.channels,
+                frameSamples = decodedFrameSamples,
+                maxBufferFrames = OboeLineSink.MAX_QUEUE_SLOTS,
+                prebufferFrames = prebufferFrames,
+            )
+            NativePlaybackEngine.configureDecoder(
+                codecType = decodeParams.codecType,
+                sampleRate = decodeParams.sampleRate,
+                channels = decodeParams.channels,
+                opusApp = decodeParams.opusApplication,
+                opusBitrate = decodeParams.opusBitrate,
+                opusComplexity = decodeParams.opusComplexity,
+                codec2Mode = decodeParams.codec2LibraryMode,
+            )
+            // Do NOT call startStream() here — the ring buffer is empty.
+            // LinkSource will auto-start playback once prebuffer frames accumulate.
+            Log.d(TAG, "Native decoder configured (stream deferred): ${decodeParams.codecType} @ ${decodeParams.sampleRate}Hz")
+
+            // Reconfigure audio output for decode rate
+            audioOutput?.let { sink ->
+                if (sink.isRunning()) sink.stop()
+                configureAudioOutput(decodeParams.sampleRate, decodeParams.channels)
+            }
+
+            linkSource =
+                LinkSource(
+                    bridge = networkPacketBridge,
+                ).apply {
+                    useNativeCodec = true
+                    deferPlaybackStart = true
+                    this.prebufferFrames = prebufferFrames
+                    // Codec/sink/sampleRate unused in native mode — decode is in C++
+                }
+        }
+
+        // --- TX: Configure native encoder on capture engine ---
+        if (audioInput == null) {
+            // Pass encoder params to OboeLineSource — it configures the native encoder
+            // in start() AFTER NativeCaptureEngine.create() succeeds. Calling
+            // configureEncoder() here would fail because the C++ singleton doesn't
+            // exist yet (OboeLineSource.start() creates it).
+            audioInput =
+                OboeLineSource(
+                    codec = activeProfile.createCodec(),
+                    targetFrameMs = activeProfile.frameTimeMs,
+                ).apply {
+                    useNativeCodec = true
+                    packetRouter = networkPacketBridge
+                    codecHeaderByte = encodeParams.codecHeaderByte
+                    nativeEncoderCodecType = encodeParams.codecType
+                    nativeEncoderSampleRate = encodeParams.sampleRate
+                    nativeEncoderChannels = encodeParams.channels
+                    nativeEncoderOpusApp = encodeParams.opusApplication
+                    nativeEncoderOpusBitrate = encodeParams.opusBitrate
+                    nativeEncoderOpusComplexity = encodeParams.opusComplexity
+                    nativeEncoderCodec2Mode = encodeParams.codec2LibraryMode
+                }
+            Log.d(TAG, "TX pipeline prepared with native encoder: ${encodeParams.codecType} @ ${encodeParams.sampleRate}Hz")
         }
     }
 
@@ -724,6 +845,14 @@ class Telephone(
      */
     private fun startPipelines() {
         Log.d(TAG, "Starting audio pipelines")
+
+        // Set MODE_IN_COMMUNICATION before starting Oboe streams.
+        // In the non-Oboe path, LineSink/LineSource do this via AudioDevice.startPlayback/
+        // startRecording. In the Oboe path, we must do it explicitly so the system knows
+        // we're in a voice call and routes audio through the voice call volume stream.
+        if (useNativePlayback) {
+            audioBridge.enterVoiceCallMode(speakerphone = false)
+        }
 
         receiveMixer?.start()
         transmitMixer?.start()
@@ -750,6 +879,11 @@ class Telephone(
         dialTone?.stop()
         audioOutput?.stop()
 
+        // Exit voice call mode — restore MODE_NORMAL so media audio is unaffected
+        if (useNativePlayback) {
+            audioBridge.exitVoiceCallMode()
+        }
+
         Log.d(TAG, "Audio pipelines stopped")
     }
 
@@ -764,6 +898,19 @@ class Telephone(
 
         val wasMuted = transmitMuted
 
+        if (useNativeCodec && useNativePlayback) {
+            reconfigureTransmitNativeCodec(wasMuted)
+        } else {
+            reconfigureTransmitPhase2(wasMuted)
+        }
+
+        Log.d(TAG, "Transmit pipeline reconfigured, mute=$wasMuted")
+    }
+
+    /**
+     * Phase 2: Reconfigure transmit with Kotlin codec + Mixers.
+     */
+    private fun reconfigureTransmitPhase2(wasMuted: Boolean) {
         // Stop current transmit path
         audioInput?.stop()
         transmitMixer?.stop()
@@ -778,14 +925,8 @@ class Telephone(
         transmitMixerAsSink = MixerSinkAdapter(transmitMixer!!)
 
         // Create new audio input with new codec
-        audioInput =
-            LineSource(
-                bridge = audioBridge,
-                codec = activeProfile.createCodec(),
-                targetFrameMs = activeProfile.frameTimeMs,
-            ).apply {
-                sink = transmitMixerAsSink
-            }
+        releaseAudioInput()
+        audioInput = createAudioInput(activeProfile, transmitMixerAsSink)
 
         // Update packetizer codec
         packetizer?.codec = activeProfile.createCodec()
@@ -796,8 +937,42 @@ class Telephone(
         // Start new pipeline
         transmitMixer?.start()
         audioInput?.start()
+    }
 
-        Log.d(TAG, "Transmit pipeline reconfigured, mute=$wasMuted")
+    /**
+     * Phase 3: Reconfigure transmit with native encoder.
+     *
+     * Destroys old native encoder, creates new one for the new profile,
+     * and restarts the capture pipeline.
+     */
+    private fun reconfigureTransmitNativeCodec(wasMuted: Boolean) {
+        val encodeParams = activeProfile.nativeEncodeParams()
+
+        // Stop capture stream
+        audioInput?.stop()
+
+        // Destroy old native encoder (cleanup before reconfigure)
+        NativeCaptureEngine.destroyEncoder()
+
+        // Update OboeLineSource encoder params for restart.
+        // OboeLineSource.start() configures the new encoder after the native
+        // engine is confirmed to exist (avoids the nullptr lifecycle bug).
+        (audioInput as? OboeLineSource)?.apply {
+            codecHeaderByte = encodeParams.codecHeaderByte
+            nativeEncoderCodecType = encodeParams.codecType
+            nativeEncoderSampleRate = encodeParams.sampleRate
+            nativeEncoderChannels = encodeParams.channels
+            nativeEncoderOpusApp = encodeParams.opusApplication
+            nativeEncoderOpusBitrate = encodeParams.opusBitrate
+            nativeEncoderOpusComplexity = encodeParams.opusComplexity
+            nativeEncoderCodec2Mode = encodeParams.codec2LibraryMode
+        }
+
+        // Restore mute state (atomic bool persists across configureEncoder)
+        NativeCaptureEngine.setCaptureMute(wasMuted)
+
+        // Restart capture — start() configures the new encoder
+        audioInput?.start()
     }
 
     // ===== Dial Tone / Ring Tone =====
@@ -1037,16 +1212,96 @@ class Telephone(
         activeProfile = profile
         reconfigureTransmitPipeline()
 
-        // Update receive decoder for new profile
-        val decodeCodec = profile.createDecodeCodec()
-        val decodeRate = decodeCodec.preferredSamplerate ?: 48000
-        linkSource?.codec = decodeCodec
-        linkSource?.sampleRate = decodeRate
+        if (useNativeCodec && useNativePlayback) {
+            // Phase 3: Reconfigure native decoder for new profile
+            val decodeParams = profile.nativeDecodeParams()
+            NativePlaybackEngine.destroyDecoder()
+            NativePlaybackEngine.configureDecoder(
+                codecType = decodeParams.codecType,
+                sampleRate = decodeParams.sampleRate,
+                channels = decodeParams.channels,
+                opusApp = decodeParams.opusApplication,
+                opusBitrate = decodeParams.opusBitrate,
+                opusComplexity = decodeParams.opusComplexity,
+                codec2Mode = decodeParams.codec2LibraryMode,
+            )
 
-        // Reconfigure audio output for new decode rate
-        audioOutput?.let { sink ->
-            if (sink.isRunning()) sink.stop()
-            sink.configure(decodeRate, 1)
+            // Reconfigure audio output for new decode rate
+            audioOutput?.let { sink ->
+                if (sink.isRunning()) sink.stop()
+                configureAudioOutput(decodeParams.sampleRate, decodeParams.channels)
+            }
+        } else {
+            // Phase 2: Update Kotlin decoder
+            val decodeCodec = profile.createDecodeCodec()
+            val decodeRate = decodeCodec.preferredSamplerate ?: 48000
+            linkSource?.codec = decodeCodec
+            linkSource?.sampleRate = decodeRate
+
+            // Reconfigure audio output for new decode rate
+            audioOutput?.let { sink ->
+                if (sink.isRunning()) sink.stop()
+                configureAudioOutput(decodeRate, 1)
+            }
+        }
+    }
+
+    // ===== Audio Output Helpers (bridge LineSink / OboeLineSink) =====
+
+    /**
+     * Release the audio output sink, regardless of concrete type.
+     */
+    private fun releaseAudioOutput() {
+        when (val sink = audioOutput) {
+            is LineSink -> sink.release()
+            is OboeLineSink -> sink.release()
+            else -> sink?.stop()
+        }
+    }
+
+    /**
+     * Configure the audio output sink for the given sample rate and channels.
+     */
+    private fun configureAudioOutput(
+        sampleRate: Int,
+        channels: Int,
+    ) {
+        when (val sink = audioOutput) {
+            is LineSink -> sink.configure(sampleRate, channels)
+            is OboeLineSink -> sink.configure(sampleRate, channels)
+            else -> {} // No-op for unknown types
+        }
+    }
+
+    /**
+     * Create an audio input source using the appropriate implementation.
+     */
+    private fun createAudioInput(
+        profile: Profile,
+        mixerSink: MixerSinkAdapter?,
+    ): LocalSource =
+        if (useNativePlayback) {
+            OboeLineSource(
+                codec = profile.createCodec(),
+                targetFrameMs = profile.frameTimeMs,
+            ).apply {
+                sink = mixerSink
+            }
+        } else {
+            LineSource(
+                bridge = audioBridge,
+                codec = profile.createCodec(),
+                targetFrameMs = profile.frameTimeMs,
+            ).apply {
+                sink = mixerSink
+            }
+        }
+
+    private fun releaseAudioInput() {
+        when (val source = audioInput) {
+            is LineSource -> source.release()
+            is OboeLineSource -> source.release()
+            else -> source?.stop()
         }
     }
 

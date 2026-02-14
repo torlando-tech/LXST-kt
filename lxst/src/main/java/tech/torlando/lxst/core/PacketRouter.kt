@@ -75,7 +75,7 @@ class PacketRouter private constructor(
     // concurrent transport access from multiple IO threads.
     // DROP_OLDEST provides backpressure: if transport can't keep up, old packets are dropped.
     private val packetChannel = Channel<ByteArray>(
-        capacity = 4,
+        capacity = 16,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 

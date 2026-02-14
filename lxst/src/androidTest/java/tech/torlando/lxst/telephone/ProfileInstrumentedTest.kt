@@ -35,12 +35,11 @@ import tech.torlando.lxst.codec.Opus
  *   MQ   (0x40) — Opus VOICE_MEDIUM→HIGH, 60ms frames, 8 kbps
  *   HQ   (0x50) — Opus VOICE_HIGH, 60ms frames, 16 kbps
  *   SHQ  (0x60) — Opus VOICE_MAX (stereo), 60ms frames, 32 kbps
- *   LL   (0x70) — Opus VOICE_MEDIUM→HIGH, 20ms frames, 8 kbps
- *   ULL  (0x80) — Opus VOICE_MEDIUM→HIGH, 10ms frames, 8 kbps
+ *   LL   (0x80) — Opus VOICE_MEDIUM→HIGH, 20ms frames, 8 kbps
+ *   ULL  (0x70) — Opus VOICE_MEDIUM→HIGH, 10ms frames, 8 kbps
  */
 @RunWith(AndroidJUnit4::class)
 class ProfileInstrumentedTest {
-
     // -- Helpers --
 
     private val codecs = mutableListOf<Codec>()
@@ -60,7 +59,11 @@ class ProfileInstrumentedTest {
         codecs.clear()
     }
 
-    private fun generateTone(sampleRate: Int, channels: Int, durationMs: Int): FloatArray {
+    private fun generateTone(
+        sampleRate: Int,
+        channels: Int,
+        durationMs: Int,
+    ): FloatArray {
         val samplesPerChannel = sampleRate * durationMs / 1000
         val totalSamples = samplesPerChannel * channels
         return FloatArray(totalSamples) { i ->
@@ -94,8 +97,8 @@ class ProfileInstrumentedTest {
         assertEquals(0x40, Profile.MQ.id)
         assertEquals(0x50, Profile.HQ.id)
         assertEquals(0x60, Profile.SHQ.id)
-        assertEquals(0x70, Profile.LL.id)
-        assertEquals(0x80, Profile.ULL.id)
+        assertEquals(0x80, Profile.LL.id)
+        assertEquals(0x70, Profile.ULL.id)
     }
 
     @Test
@@ -103,7 +106,7 @@ class ProfileInstrumentedTest {
         Profile.all.forEach { profile ->
             assertTrue(
                 "${profile.abbreviation} frameTimeMs should be > 0, was ${profile.frameTimeMs}",
-                profile.frameTimeMs > 0
+                profile.frameTimeMs > 0,
             )
         }
     }
@@ -115,7 +118,8 @@ class ProfileInstrumentedTest {
             assertNotNull("Profile.fromId(0x${profile.id.toString(16)}) should resolve", resolved)
             assertEquals(
                 "fromId should return same profile for ${profile.abbreviation}",
-                profile, resolved
+                profile,
+                resolved,
             )
         }
     }
@@ -207,8 +211,8 @@ class ProfileInstrumentedTest {
         val encCodec = trackCodec(Profile.MQ.createCodec()) as Opus
         val decCodec = trackCodec(Profile.MQ.createDecodeCodec()) as Opus
 
-        val encRate = encCodec.preferredSamplerate!!  // 24000
-        val decRate = decCodec.preferredSamplerate!!  // 48000
+        val encRate = encCodec.preferredSamplerate!! // 24000
+        val decRate = decCodec.preferredSamplerate!! // 48000
 
         val input = generateTone(encRate, 1, Profile.MQ.frameTimeMs)
         assertEquals("Input: 60ms at 24kHz = 1440", 1440, input.size)
@@ -220,7 +224,8 @@ class ProfileInstrumentedTest {
         val expectedDecoded = decRate * Profile.MQ.frameTimeMs / 1000
         assertEquals(
             "Decoded at 48kHz should be $expectedDecoded samples (2× input)",
-            expectedDecoded, decoded.size
+            expectedDecoded,
+            decoded.size,
         )
 
         assertTrue("Decoded audio should not be silent", rmsEnergy(decoded) > 0.01)
@@ -237,14 +242,15 @@ class ProfileInstrumentedTest {
 
         val totalBytes = (1..20).sumOf { codec.encode(input).size }
         val avgBytes = totalBytes / 20.0
-        val maxBytes = Opus.maxBytesPerFrame(
-            Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MEDIUM),
-            Profile.MQ.frameTimeMs.toFloat()
-        )
+        val maxBytes =
+            Opus.maxBytesPerFrame(
+                Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MEDIUM),
+                Profile.MQ.frameTimeMs.toFloat(),
+            )
 
         assertTrue(
-            "MQ avg ${avgBytes} bytes/frame should be near $maxBytes ceiling (±20%)",
-            avgBytes <= maxBytes * 1.2
+            "MQ avg $avgBytes bytes/frame should be near $maxBytes ceiling (±20%)",
+            avgBytes <= maxBytes * 1.2,
         )
         releaseAll()
     }
@@ -306,14 +312,15 @@ class ProfileInstrumentedTest {
         val input = generateTone(48000, 1, Profile.HQ.frameTimeMs)
 
         val encoded = codec.encode(input)
-        val maxBytes = Opus.maxBytesPerFrame(
-            Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_HIGH),
-            Profile.HQ.frameTimeMs.toFloat()
-        )
+        val maxBytes =
+            Opus.maxBytesPerFrame(
+                Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_HIGH),
+                Profile.HQ.frameTimeMs.toFloat(),
+            )
 
         assertTrue(
             "HQ encoded ${encoded.size} bytes should fit in $maxBytes ceiling",
-            encoded.size <= maxBytes
+            encoded.size <= maxBytes,
         )
         releaseAll()
     }
@@ -378,14 +385,15 @@ class ProfileInstrumentedTest {
         val input = generateTone(48000, channels, Profile.SHQ.frameTimeMs)
 
         val encoded = codec.encode(input)
-        val maxBytes = Opus.maxBytesPerFrame(
-            Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MAX),
-            Profile.SHQ.frameTimeMs.toFloat()
-        )
+        val maxBytes =
+            Opus.maxBytesPerFrame(
+                Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MAX),
+                Profile.SHQ.frameTimeMs.toFloat(),
+            )
 
         assertTrue(
             "SHQ encoded ${encoded.size} bytes should fit in $maxBytes ceiling",
-            encoded.size <= maxBytes
+            encoded.size <= maxBytes,
         )
         releaseAll()
     }
@@ -471,7 +479,8 @@ class ProfileInstrumentedTest {
 
         assertEquals(
             "LL decoded at 48kHz should be 960 samples (2× encode rate)",
-            960, decoded.size
+            960,
+            decoded.size,
         )
         assertTrue("LL decoded audio should not be silent", rmsEnergy(decoded) > 0.01)
         releaseAll()
@@ -485,14 +494,15 @@ class ProfileInstrumentedTest {
 
         val totalBytes = (1..50).sumOf { codec.encode(input).size }
         val avgBytes = totalBytes / 50.0
-        val maxBytes = Opus.maxBytesPerFrame(
-            Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MEDIUM),
-            Profile.LL.frameTimeMs.toFloat()
-        )
+        val maxBytes =
+            Opus.maxBytesPerFrame(
+                Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MEDIUM),
+                Profile.LL.frameTimeMs.toFloat(),
+            )
 
         assertTrue(
-            "LL avg ${avgBytes} bytes/frame should be near $maxBytes ceiling (±25%)",
-            avgBytes <= maxBytes * 1.25
+            "LL avg $avgBytes bytes/frame should be near $maxBytes ceiling (±25%)",
+            avgBytes <= maxBytes * 1.25,
         )
         releaseAll()
     }
@@ -553,7 +563,8 @@ class ProfileInstrumentedTest {
 
         assertEquals(
             "ULL decoded at 48kHz should be 480 samples (2× encode rate)",
-            480, decoded.size
+            480,
+            decoded.size,
         )
         assertTrue("ULL decoded audio should not be silent", rmsEnergy(decoded) > 0.01)
         releaseAll()
@@ -565,14 +576,15 @@ class ProfileInstrumentedTest {
         val input = generateTone(24000, 1, Profile.ULL.frameTimeMs)
 
         val encoded = codec.encode(input)
-        val maxBytes = Opus.maxBytesPerFrame(
-            Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MEDIUM),
-            Profile.ULL.frameTimeMs.toFloat()
-        )
+        val maxBytes =
+            Opus.maxBytesPerFrame(
+                Opus.profileBitrateCeiling(Opus.PROFILE_VOICE_MEDIUM),
+                Profile.ULL.frameTimeMs.toFloat(),
+            )
 
         assertTrue(
             "ULL encoded ${encoded.size} bytes should fit in $maxBytes ceiling",
-            encoded.size <= maxBytes
+            encoded.size <= maxBytes,
         )
         releaseAll()
     }
@@ -618,13 +630,15 @@ class ProfileInstrumentedTest {
         // First byte is the mode header
         assertEquals(
             "ULBW header byte should be 0x00 (700C)",
-            Codec2.MODE_HEADERS[Codec2.CODEC2_700C], encoded[0]
+            Codec2.MODE_HEADERS[Codec2.CODEC2_700C],
+            encoded[0],
         )
 
         val decoded = codec.decode(encoded)
         assertEquals(
             "ULBW round-trip: 3200 samples in → 3200 samples out",
-            frameSize, decoded.size
+            frameSize,
+            decoded.size,
         )
         releaseAll()
     }
@@ -665,13 +679,15 @@ class ProfileInstrumentedTest {
         val encoded = codec.encode(input)
         assertEquals(
             "VLBW header byte should be 0x04 (1600)",
-            Codec2.MODE_HEADERS[Codec2.CODEC2_1600], encoded[0]
+            Codec2.MODE_HEADERS[Codec2.CODEC2_1600],
+            encoded[0],
         )
 
         val decoded = codec.decode(encoded)
         assertEquals(
             "VLBW round-trip: 2560 samples in → 2560 samples out",
-            frameSize, decoded.size
+            frameSize,
+            decoded.size,
         )
         releaseAll()
     }
@@ -712,13 +728,15 @@ class ProfileInstrumentedTest {
         val encoded = codec.encode(input)
         assertEquals(
             "LBW header byte should be 0x06 (3200)",
-            Codec2.MODE_HEADERS[Codec2.CODEC2_3200], encoded[0]
+            Codec2.MODE_HEADERS[Codec2.CODEC2_3200],
+            encoded[0],
         )
 
         val decoded = codec.decode(encoded)
         assertEquals(
             "LBW round-trip: 1600 samples in → 1600 samples out",
-            frameSize, decoded.size
+            frameSize,
+            decoded.size,
         )
         releaseAll()
     }
@@ -749,11 +767,12 @@ class ProfileInstrumentedTest {
         // MQ (60ms), LL (20ms), ULL (10ms) all share the same asymmetry:
         // encode at VOICE_MEDIUM (24kHz), decode at VOICE_HIGH (48kHz).
         // Output samples should be exactly 2× input samples (rate doubling).
-        val asymmetricProfiles = listOf(
-            Profile.MQ to "MQ",
-            Profile.LL to "LL",
-            Profile.ULL to "ULL"
-        )
+        val asymmetricProfiles =
+            listOf(
+                Profile.MQ to "MQ",
+                Profile.LL to "LL",
+                Profile.ULL to "ULL",
+            )
 
         for ((profile, name) in asymmetricProfiles) {
             val encCodec = trackCodec(profile.createCodec()) as Opus
@@ -775,8 +794,9 @@ class ProfileInstrumentedTest {
             val decoded = decCodec.decode(encoded)
 
             assertEquals(
-                "$name: encode ${inputSamples} @ 24kHz → decode ${expectedOutput} @ 48kHz",
-                expectedOutput, decoded.size
+                "$name: encode $inputSamples @ 24kHz → decode $expectedOutput @ 48kHz",
+                expectedOutput,
+                decoded.size,
             )
 
             assertTrue("$name decoded should not be silent", rmsEnergy(decoded) > 0.01)
@@ -792,7 +812,8 @@ class ProfileInstrumentedTest {
 
         assertEquals(
             "HQ encode and decode should use same rate",
-            encCodec.preferredSamplerate, decCodec.preferredSamplerate
+            encCodec.preferredSamplerate,
+            decCodec.preferredSamplerate,
         )
 
         // SHQ uses VOICE_MAX for both (48kHz stereo)
@@ -801,7 +822,8 @@ class ProfileInstrumentedTest {
 
         assertEquals(
             "SHQ encode and decode should use same rate",
-            shqEnc.preferredSamplerate, shqDec.preferredSamplerate
+            shqEnc.preferredSamplerate,
+            shqDec.preferredSamplerate,
         )
         releaseAll()
     }
@@ -820,7 +842,7 @@ class ProfileInstrumentedTest {
             val budgetMs = LineSink.MAX_FRAMES * profile.frameTimeMs
             assertTrue(
                 "${profile.abbreviation} jitter budget ${budgetMs}ms should be > 100ms",
-                budgetMs > 100
+                budgetMs > 100,
             )
         }
     }
@@ -838,18 +860,20 @@ class ProfileInstrumentedTest {
             val decCodec = trackCodec(profile.createDecodeCodec())
 
             val sampleRate = encCodec.preferredSamplerate!!
-            val channels = when (encCodec) {
-                is Opus -> Opus.profileChannels(
-                    when (profile) {
-                        Profile.MQ, Profile.LL, Profile.ULL -> Opus.PROFILE_VOICE_MEDIUM
-                        Profile.HQ -> Opus.PROFILE_VOICE_HIGH
-                        Profile.SHQ -> Opus.PROFILE_VOICE_MAX
-                        else -> error("Not Opus")
-                    }
-                )
-                is Codec2 -> 1
-                else -> 1
-            }
+            val channels =
+                when (encCodec) {
+                    is Opus ->
+                        Opus.profileChannels(
+                            when (profile) {
+                                Profile.MQ, Profile.LL, Profile.ULL -> Opus.PROFILE_VOICE_MEDIUM
+                                Profile.HQ -> Opus.PROFILE_VOICE_HIGH
+                                Profile.SHQ -> Opus.PROFILE_VOICE_MAX
+                                else -> error("Not Opus")
+                            },
+                        )
+                    is Codec2 -> 1
+                    else -> 1
+                }
 
             val input = generateTone(sampleRate, channels, profile.frameTimeMs)
             val encoded = encCodec.encode(input)
@@ -859,30 +883,33 @@ class ProfileInstrumentedTest {
             assertTrue("${profile.abbreviation} decode should produce samples", decoded.isNotEmpty())
 
             val decRate = decCodec.preferredSamplerate!!
-            val decChannels = when (decCodec) {
-                is Opus -> {
-                    val p = when (profile) {
-                        Profile.MQ, Profile.LL, Profile.ULL -> Opus.PROFILE_VOICE_HIGH
-                        Profile.HQ -> Opus.PROFILE_VOICE_HIGH
-                        Profile.SHQ -> Opus.PROFILE_VOICE_MAX
-                        else -> error("Not Opus")
+            val decChannels =
+                when (decCodec) {
+                    is Opus -> {
+                        val p =
+                            when (profile) {
+                                Profile.MQ, Profile.LL, Profile.ULL -> Opus.PROFILE_VOICE_HIGH
+                                Profile.HQ -> Opus.PROFILE_VOICE_HIGH
+                                Profile.SHQ -> Opus.PROFILE_VOICE_MAX
+                                else -> error("Not Opus")
+                            }
+                        Opus.profileChannels(p)
                     }
-                    Opus.profileChannels(p)
+                    is Codec2 -> 1
+                    else -> 1
                 }
-                is Codec2 -> 1
-                else -> 1
-            }
             val expectedDecoded = decRate * profile.frameTimeMs / 1000 * decChannels
 
             assertEquals(
                 "${profile.abbreviation} decoded sample count",
-                expectedDecoded, decoded.size
+                expectedDecoded,
+                decoded.size,
             )
 
             results.add(
                 "${profile.abbreviation} (0x${profile.id.toString(16)}): " +
-                "${input.size} in → ${encoded.size} bytes → ${decoded.size} out " +
-                "(${profile.frameTimeMs}ms, enc=${sampleRate}Hz, dec=${decRate}Hz)"
+                    "${input.size} in → ${encoded.size} bytes → ${decoded.size} out " +
+                    "(${profile.frameTimeMs}ms, enc=${sampleRate}Hz, dec=${decRate}Hz)",
             )
         }
 
@@ -963,7 +990,8 @@ class ProfileInstrumentedTest {
         val crossDecoded = lbwCodec.decode(ulbwEncoded)
         assertEquals(
             "Cross-decode should switch mode and produce ULBW frame size",
-            ulbwInput.size, crossDecoded.size
+            ulbwInput.size,
+            crossDecoded.size,
         )
         releaseAll()
     }

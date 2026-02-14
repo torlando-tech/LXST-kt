@@ -5,13 +5,13 @@
 package tech.torlando.lxst.audio
 
 import android.util.Log
-import tech.torlando.lxst.core.AudioDevice
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import tech.torlando.lxst.core.AudioDevice
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -32,24 +32,23 @@ import java.util.concurrent.atomic.AtomicLong
 class LineSink(
     private val bridge: AudioDevice,
     private val autodigest: Boolean = true,
-    private val lowLatency: Boolean = false
+    private val lowLatency: Boolean = false,
 ) : LocalSink() {
-
     companion object {
         private const val TAG = "Columba:LineSink"
 
         // Time-based buffer targets — ensures all profiles get adequate jitter
         // absorption regardless of frame duration. With MQ (60ms) → 25 frames;
         // LL (20ms) → 75 frames; ULL (10ms) → 150 frames.
-        const val BUFFER_CAPACITY_MS = 1500L  // Max queue depth in ms
-        const val PREBUFFER_MS = 500L          // Pre-fill before playback in ms
-        const val MAX_QUEUE_SLOTS = 150        // Physical queue capacity (1500ms / 10ms ULL)
+        const val BUFFER_CAPACITY_MS = 1500L // Max queue depth in ms
+        const val PREBUFFER_MS = 500L // Pre-fill before playback in ms
+        const val MAX_QUEUE_SLOTS = 150 // Physical queue capacity (1500ms / 10ms ULL)
 
         // Re-buffer policy: only sustained outages trigger re-buffer.
         // Brief jitter gaps (< 500ms) resume immediately — AudioTrack's 500ms
         // internal buffer absorbs the jitter without audible interruption.
-        const val REBUFFER_TRIGGER_MS = 500L  // Underrun must last this long to trigger re-buffer
-        const val REBUFFER_FRAMES = 5         // Frames needed to exit re-buffer state
+        const val REBUFFER_TRIGGER_MS = 500L // Underrun must last this long to trigger re-buffer
+        const val REBUFFER_FRAMES = 5 // Frames needed to exit re-buffer state
 
         // Legacy constants for test backward compatibility and initial defaults.
         // Effective limits are recomputed from frame time in updateBufferLimits().
@@ -63,7 +62,10 @@ class LineSink(
     // Effective limits recomputed when frame time is known (see updateBufferLimits).
     // Start with legacy values for backward compatibility with initial autostart.
     @Volatile private var effectiveMaxFrames: Int = MAX_FRAMES
+
     @Volatile private var effectiveAutostartMin: Int = AUTOSTART_MIN
+
+    @Volatile private var bufferLimitsInitialized: Boolean = false
 
     // Playback state
     private val isRunningFlag = AtomicBoolean(false)
@@ -87,9 +89,7 @@ class LineSink(
      * @param fromSource Optional source reference (unused, for interface compatibility)
      * @return true if queue has room, false if backpressure active
      */
-    override fun canReceive(fromSource: Source?): Boolean {
-        return frameQueue.size < effectiveMaxFrames - 1
-    }
+    override fun canReceive(fromSource: Source?): Boolean = frameQueue.size < effectiveMaxFrames - 1
 
     /**
      * Handle an incoming audio frame.
@@ -101,7 +101,10 @@ class LineSink(
      * @param frame Float32 audio samples (decoded)
      * @param source Optional source reference for sample rate detection
      */
-    override fun handleFrame(frame: FloatArray, source: Source?) {
+    override fun handleFrame(
+        frame: FloatArray,
+        source: Source?,
+    ) {
         // Prevent stale frames from auto-restarting a released sink
         if (releasedFlag.get()) return
 
@@ -110,6 +113,19 @@ class LineSink(
             sampleRate = source?.sampleRate ?: AudioDevice.DEFAULT_SAMPLE_RATE
             channels = source?.channels ?: 1
             Log.i(TAG, "LineSink detected: rate=$sampleRate, channels=$channels")
+        }
+
+        // Detect frame time on first frame to set correct prebuffer depth.
+        // Must happen before autostart check: without this, effectiveAutostartMin
+        // stays at AUTOSTART_MIN (5) and start() triggers with too few frames,
+        // leaving AudioTrack's internal buffer too shallow to absorb network jitter.
+        if (!bufferLimitsInitialized && sampleRate > 0) {
+            val detectedFrameTimeMs = ((frame.size.toFloat() / (sampleRate * channels)) * 1000).toLong()
+            if (detectedFrameTimeMs > 0) {
+                frameTimeMs = detectedFrameTimeMs
+                updateBufferLimits(detectedFrameTimeMs)
+                bufferLimitsInitialized = true
+            }
         }
 
         // Non-blocking offer, drop oldest if full (prevents blocking source)
@@ -149,20 +165,52 @@ class LineSink(
             try {
                 if (!isRunningFlag.get()) return@launch
 
+                // Create AudioTrack but DON'T start playback yet — we need to
+                // prebuffer data first so AudioTrack starts with a full buffer.
                 bridge.startPlayback(
                     sampleRate = sampleRate,
                     channels = channels,
-                    lowLatency = lowLatency
+                    lowLatency = lowLatency,
+                    autoPlay = false,
                 )
 
-                // Drain excess frames that accumulated during AudioTrack creation (~500ms).
-                // Keep only the most recent effectiveAutostartMin frames so playback starts
-                // with a reasonable buffer, not 780ms+ of stale audio that causes permanent delay.
+                // Drain excess frames that accumulated during AudioTrack creation.
+                // Keep only the most recent effectiveAutostartMin frames.
                 val excess = frameQueue.size - effectiveAutostartMin
                 if (excess > 0) {
                     repeat(excess) { frameQueue.poll() }
                     Log.i(TAG, "Drained $excess stale frames after AudioTrack init (kept $effectiveAutostartMin)")
                 }
+
+                // Prebuffer: write frames to AudioTrack BEFORE play().
+                // Data written before play() stays in the internal buffer without
+                // being consumed by DMA. This ensures playback starts with a full
+                // prebuffer (e.g., 480ms for MQ), providing robust jitter absorption.
+                //
+                // IMPORTANT: Limit writes to AudioTrack's buffer capacity to avoid
+                // WRITE_BLOCKING deadlock (play() not called yet, so buffer never drains).
+                // Buffer is at least sampleRate * channels * 2_bytes * 500ms / 1000.
+                val bufferCapacityBytes = sampleRate * channels * 2 * 500 / 1000
+                val firstFrame = frameQueue.peek()
+                val frameSizeBytes = (firstFrame?.size ?: 0) * 2 // float32 → PCM16
+                val maxPrebufferFrames =
+                    if (frameSizeBytes > 0) {
+                        (bufferCapacityBytes / frameSizeBytes).coerceAtLeast(1)
+                    } else {
+                        effectiveAutostartMin
+                    }
+
+                var prebufferCount = 0
+                while (prebufferCount < maxPrebufferFrames && isRunningFlag.get()) {
+                    val frame = frameQueue.poll() ?: break
+                    val frameBytes = float32ToBytes(frame)
+                    bridge.writeAudio(frameBytes)
+                    prebufferCount++
+                }
+                Log.i(TAG, "Prebuffered $prebufferCount/$maxPrebufferFrames frames into AudioTrack before play()")
+
+                // NOW start playback — AudioTrack's buffer is pre-filled.
+                bridge.beginPlayback()
 
                 if (isRunningFlag.get()) {
                     digestJob()
@@ -224,8 +272,11 @@ class LineSink(
                 } else {
                     rebufferWaitCount++
                     if (rebufferWaitCount % 50 == 1) {
-                        Log.d(TAG, "Re-buffering: queue=${frameQueue.size}/$REBUFFER_FRAMES, " +
-                            "waited ${rebufferWaitCount * frameTimeMs}ms, hfCount=${handleFrameCount.get()}")
+                        Log.d(
+                            TAG,
+                            "Re-buffering: queue=${frameQueue.size}/$REBUFFER_FRAMES, " +
+                                "waited ${rebufferWaitCount * frameTimeMs}ms, hfCount=${handleFrameCount.get()}",
+                        )
                     }
                     delay(frameTimeMs)
                     continue
@@ -309,12 +360,19 @@ class LineSink(
      *   ULL (10ms): maxFrames=150, autostartMin=50 → 1500ms/500ms
      */
     private fun updateBufferLimits(detectedFrameTimeMs: Long) {
-        effectiveMaxFrames = (BUFFER_CAPACITY_MS / detectedFrameTimeMs).toInt()
-            .coerceIn(MAX_FRAMES, MAX_QUEUE_SLOTS)
-        effectiveAutostartMin = (PREBUFFER_MS / detectedFrameTimeMs).toInt()
-            .coerceIn(AUTOSTART_MIN, effectiveMaxFrames / 2)
-        Log.i(TAG, "Buffer limits: max=$effectiveMaxFrames, prebuffer=$effectiveAutostartMin " +
-            "(${effectiveMaxFrames * detectedFrameTimeMs}ms/${effectiveAutostartMin * detectedFrameTimeMs}ms)")
+        effectiveMaxFrames =
+            (BUFFER_CAPACITY_MS / detectedFrameTimeMs)
+                .toInt()
+                .coerceIn(MAX_FRAMES, MAX_QUEUE_SLOTS)
+        effectiveAutostartMin =
+            (PREBUFFER_MS / detectedFrameTimeMs)
+                .toInt()
+                .coerceIn(AUTOSTART_MIN, effectiveMaxFrames / 2)
+        Log.i(
+            TAG,
+            "Buffer limits: max=$effectiveMaxFrames, prebuffer=$effectiveAutostartMin " +
+                "(${effectiveMaxFrames * detectedFrameTimeMs}ms/${effectiveAutostartMin * detectedFrameTimeMs}ms)",
+        )
     }
 
     /**
@@ -331,7 +389,10 @@ class LineSink(
      *
      * Call before start() if not using auto-detection.
      */
-    fun configure(sampleRate: Int, channels: Int = 1) {
+    fun configure(
+        sampleRate: Int,
+        channels: Int = 1,
+    ) {
         this.sampleRate = sampleRate
         this.channels = channels
         Log.d(TAG, "LineSink configured: rate=$sampleRate, channels=$channels")
