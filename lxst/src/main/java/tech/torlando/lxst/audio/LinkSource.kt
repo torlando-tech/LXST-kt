@@ -47,6 +47,9 @@ class LinkSource(
 
         /** Maximum packets in queue before dropping oldest (backpressure) */
         const val MAX_PACKETS = 32
+
+        /** Decoded frames to accumulate before starting the Oboe stream (Phase 3). */
+        const val NATIVE_PREBUFFER_FRAMES = 5
     }
 
     // RemoteSource properties
@@ -77,6 +80,17 @@ class LinkSource(
      */
     @Volatile
     var useNativeCodec: Boolean = false
+
+    /**
+     * Phase 3: When true, auto-start the native playback stream after
+     * [NATIVE_PREBUFFER_FRAMES] decoded frames have accumulated in the ring buffer.
+     *
+     * Mirrors the Phase 2 pattern where OboeLineSink defers startStream() until
+     * the buffer has enough data to prevent callback starvation.
+     */
+    @Volatile
+    var deferPlaybackStart: Boolean = false
+    private val playbackStarted = AtomicBoolean(false)
     private val packetQueue = ArrayDeque<ByteArray>(MAX_PACKETS)
     private val receiveLock = Any()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -142,6 +156,19 @@ class LinkSource(
             // Skip header byte via offset parameter (no copyOfRange allocation).
             try {
                 NativePlaybackEngine.writeEncodedPacket(data, 1, data.size - 1)
+
+                // Auto-start playback stream once prebuffer has accumulated.
+                // Mirrors Phase 2's OboeLineSink pattern: defer startStream() until
+                // the ring buffer has enough data to prevent callback starvation.
+                if (deferPlaybackStart && !playbackStarted.get()) {
+                    val buffered = NativePlaybackEngine.getBufferedFrameCount()
+                    if (buffered >= NATIVE_PREBUFFER_FRAMES) {
+                        if (playbackStarted.compareAndSet(false, true)) {
+                            val started = NativePlaybackEngine.startStream()
+                            Log.i(TAG, "Auto-started native playback: prebuf=$buffered, ok=$started")
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Native decode error, dropping frame: ${e.message}")
             }
@@ -201,6 +228,7 @@ class LinkSource(
      */
     override fun stop() {
         shouldRun.set(false)
+        playbackStarted.set(false)
         synchronized(receiveLock) {
             packetQueue.clear()
         }

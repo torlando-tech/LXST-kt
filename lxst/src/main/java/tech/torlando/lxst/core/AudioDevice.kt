@@ -692,6 +692,52 @@ class AudioDevice(
      */
     fun areFiltersEnabled(): Boolean = filtersEnabled
 
+    // ===== Voice Call Audio Mode (for Oboe path) =====
+
+    /**
+     * Set audio mode to MODE_IN_COMMUNICATION and configure speaker/earpiece routing.
+     *
+     * Must be called when using native Oboe streams (Phase 2+) since OboeLineSink
+     * and OboeLineSource bypass AudioDevice and never call startPlayback()/startRecording().
+     * Without this, the voice call volume stream may be muted or very low on some devices
+     * (Samsung S21, etc.) because the system doesn't know we're in a voice call.
+     *
+     * @param speakerphone True for speaker, false for earpiece
+     */
+    @Suppress("DEPRECATION")
+    fun enterVoiceCallMode(speakerphone: Boolean) {
+        val previousMode = audioManager.mode
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        speakerphoneOn = speakerphone
+        Log.i(TAG, "📞 Voice call mode: $previousMode -> ${audioManager.mode}")
+
+        // Log volume levels
+        val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
+
+        // Apply speaker/earpiece routing
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            setCommunicationDeviceByType(speakerphone)
+        } else {
+            audioManager.isSpeakerphoneOn = speakerphone
+        }
+    }
+
+    /**
+     * Exit voice call mode, restoring MODE_NORMAL.
+     *
+     * Called when the call ends to release the audio mode.
+     */
+    @Suppress("DEPRECATION")
+    fun exitVoiceCallMode() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.clearCommunicationDevice()
+        }
+        audioManager.mode = AudioManager.MODE_NORMAL
+        Log.i(TAG, "📞 Exited voice call mode (MODE_NORMAL)")
+    }
+
     // ===== Audio Routing (called from Python) =====
 
     /**

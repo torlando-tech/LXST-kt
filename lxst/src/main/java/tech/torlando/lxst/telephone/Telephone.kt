@@ -789,8 +789,9 @@ class Telephone(
                 opusComplexity = decodeParams.opusComplexity,
                 codec2Mode = decodeParams.codec2LibraryMode,
             )
-            NativePlaybackEngine.startStream()
-            Log.d(TAG, "Native decoder configured + stream started: ${decodeParams.codecType} @ ${decodeParams.sampleRate}Hz")
+            // Do NOT call startStream() here — the ring buffer is empty.
+            // LinkSource will auto-start playback once prebuffer frames accumulate.
+            Log.d(TAG, "Native decoder configured (stream deferred): ${decodeParams.codecType} @ ${decodeParams.sampleRate}Hz")
 
             // Reconfigure audio output for decode rate
             audioOutput?.let { sink ->
@@ -803,6 +804,7 @@ class Telephone(
                     bridge = networkPacketBridge,
                 ).apply {
                     useNativeCodec = true
+                    deferPlaybackStart = true
                     // Codec/sink/sampleRate unused in native mode — decode is in C++
                 }
         }
@@ -841,6 +843,14 @@ class Telephone(
     private fun startPipelines() {
         Log.d(TAG, "Starting audio pipelines")
 
+        // Set MODE_IN_COMMUNICATION before starting Oboe streams.
+        // In the non-Oboe path, LineSink/LineSource do this via AudioDevice.startPlayback/
+        // startRecording. In the Oboe path, we must do it explicitly so the system knows
+        // we're in a voice call and routes audio through the voice call volume stream.
+        if (useNativePlayback) {
+            audioBridge.enterVoiceCallMode(speakerphone = false)
+        }
+
         receiveMixer?.start()
         transmitMixer?.start()
         audioInput?.start()
@@ -865,6 +875,11 @@ class Telephone(
         packetizer?.stop()
         dialTone?.stop()
         audioOutput?.stop()
+
+        // Exit voice call mode — restore MODE_NORMAL so media audio is unaffected
+        if (useNativePlayback) {
+            audioBridge.exitVoiceCallMode()
+        }
 
         Log.d(TAG, "Audio pipelines stopped")
     }
