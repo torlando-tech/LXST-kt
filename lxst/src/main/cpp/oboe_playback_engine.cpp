@@ -166,9 +166,10 @@ void OboePlaybackEngine::closeStream() {
 bool OboePlaybackEngine::restartStream() {
     if (!isPlaying_.load()) return false;
     LOGI("Restarting stream for audio routing change");
+    isPlaying_.store(false);
     closeStream();
     stream_.reset();
-    return openStream();
+    return openStream();  // restores isPlaying_ = true on success
 }
 
 // --- Oboe audio callback (runs on SCHED_FIFO thread) ---
