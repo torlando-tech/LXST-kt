@@ -99,8 +99,9 @@ int OboePlaybackEngine::getBufferedFrameCount() const {
 }
 
 int OboePlaybackEngine::getXRunCount() const {
-    if (!stream_) return 0;
-    auto result = stream_->getXRunCount();
+    auto s = stream_;  // Local copy prevents TOCTOU if stream_ is reset concurrently
+    if (!s) return 0;
+    auto result = s->getXRunCount();
     return (result.value() > 0) ? result.value() : 0;
 }
 
