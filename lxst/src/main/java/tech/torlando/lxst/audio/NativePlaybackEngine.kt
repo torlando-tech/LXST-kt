@@ -72,6 +72,17 @@ object NativePlaybackEngine {
         return nativeStartStream()
     }
 
+    /**
+     * Close and reopen the Oboe stream to pick up audio routing changes.
+     *
+     * Called when the speaker/earpiece toggle changes so the native stream
+     * binds to the newly-routed audio device.
+     */
+    fun restartStream(): Boolean {
+        ensureLoaded()
+        return nativeRestartStream()
+    }
+
     /** Stop and close the Oboe output stream. */
     fun stopStream() {
         ensureLoaded()
@@ -178,6 +189,8 @@ object NativePlaybackEngine {
     private external fun nativeWriteSamples(samples: ShortArray): Boolean
 
     private external fun nativeStartStream(): Boolean
+
+    private external fun nativeRestartStream(): Boolean
 
     private external fun nativeStopStream()
 

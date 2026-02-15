@@ -36,6 +36,7 @@ bool OboePlaybackEngine::create(int sampleRate, int channels, int frameSamples,
     callbackBufferValid_ = 0;
 
     isCreated_.store(true);
+    destroyed_.store(false, std::memory_order_release);
     LOGI("Created: rate=%d ch=%d frameSamples=%d maxBuf=%d prebuf=%d",
          sampleRate, channels, frameSamples, maxBufferFrames, prebufferFrames);
     return true;
@@ -72,10 +73,14 @@ bool OboePlaybackEngine::startStream() {
 void OboePlaybackEngine::stopStream() {
     isPlaying_.store(false);
     closeStream();
+    stream_.reset();
 }
 
 void OboePlaybackEngine::destroy() {
-    stopStream();
+    destroyed_.store(true, std::memory_order_release);
+    isPlaying_.store(false);
+    closeStream();
+    stream_.reset();       // Safe now — close() has returned and destroyed_ guards callback
     destroyDecoder();
     ringBuffer_.reset();
     callbackBuffer_.reset();
@@ -153,11 +158,17 @@ bool OboePlaybackEngine::openStream() {
 
 void OboePlaybackEngine::closeStream() {
     if (stream_) {
-        stream_->stop();
-        stream_->close();
-        stream_.reset();
+        stream_->close();  // close() internally stops — calling stop() first is unnecessary
         LOGI("Stream closed");
     }
+}
+
+bool OboePlaybackEngine::restartStream() {
+    if (!isPlaying_.load()) return false;
+    LOGI("Restarting stream for audio routing change");
+    closeStream();
+    stream_.reset();
+    return openStream();
 }
 
 // --- Oboe audio callback (runs on SCHED_FIFO thread) ---
@@ -169,6 +180,12 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
 
     auto* output = static_cast<int16_t*>(audioData);
     int32_t totalSamples = numFrames * channels_;
+
+    // Guard against callback firing after destroy() on OpenSL ES legacy path
+    if (destroyed_.load(std::memory_order_acquire)) {
+        std::memset(output, 0, sizeof(int16_t) * totalSamples);
+        return oboe::DataCallbackResult::Stop;
+    }
 
     // Phase 3: Mute outputs silence, ring buffer continues accumulating
     if (playbackMuted_.load(std::memory_order_relaxed)) {

@@ -114,6 +114,15 @@ Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeGetXRunCount(
     return sEngine ? sEngine->getXRunCount() : 0;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeRestartStream(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
+    if (!sEngine) return JNI_FALSE;
+    return static_cast<jboolean>(sEngine->restartStream());
+}
+
 // --- Phase 3: Native codec JNI methods ---
 
 JNIEXPORT jboolean JNICALL

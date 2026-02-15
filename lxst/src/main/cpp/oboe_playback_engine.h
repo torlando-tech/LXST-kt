@@ -165,6 +165,18 @@ private:
     bool openStream();
     void closeStream();
 
+public:
+    /**
+     * Close and reopen the Oboe stream to pick up audio routing changes.
+     *
+     * Called when the speaker/earpiece toggle changes — many HALs (especially
+     * Samsung low-end OpenSL ES) don't dynamically re-route already-open streams.
+     *
+     * @return true if the stream was successfully restarted
+     */
+    bool restartStream();
+
+private:
     int sampleRate_ = 0;
     int channels_ = 0;
     int frameSamples_ = 0;     // Samples per LXST frame
@@ -175,6 +187,7 @@ private:
 
     std::atomic<bool> isPlaying_{false};
     std::atomic<bool> isCreated_{false};
+    std::atomic<bool> destroyed_{false};
 
     // Partial frame tracking — handles burst size < LXST frame size.
     // When the Oboe callback requests fewer samples than one LXST frame,
