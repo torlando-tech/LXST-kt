@@ -5,6 +5,7 @@
 #include "oboe_playback_engine.h"
 #include <android/log.h>
 #include <cstring>
+#include <unistd.h>
 
 #define LOG_TAG "LXST:OboeEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -36,6 +37,7 @@ bool OboePlaybackEngine::create(int sampleRate, int channels, int frameSamples,
     callbackBufferValid_ = 0;
 
     isCreated_.store(true);
+    destroyed_.store(false, std::memory_order_release);
     LOGI("Created: rate=%d ch=%d frameSamples=%d maxBuf=%d prebuf=%d",
          sampleRate, channels, frameSamples, maxBufferFrames, prebufferFrames);
     return true;
@@ -61,6 +63,8 @@ bool OboePlaybackEngine::startStream() {
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(streamLock_);
+
     if (isPlaying_.load()) {
         LOGW("Stream already playing");
         return true;
@@ -70,22 +74,33 @@ bool OboePlaybackEngine::startStream() {
 }
 
 void OboePlaybackEngine::stopStream() {
+    std::lock_guard<std::mutex> lock(streamLock_);
     isPlaying_.store(false);
     closeStream();
+    stream_.reset();
 }
 
 void OboePlaybackEngine::destroy() {
-    stopStream();
+    destroyed_.store(true, std::memory_order_release);
+    isCreated_.store(false);  // Prevent restartStream/onErrorAfterClose from reopening
+    {
+        std::lock_guard<std::mutex> lock(streamLock_);
+        isPlaying_.store(false);
+        closeStream();
+        stream_.reset();
+    }
     destroyDecoder();
     ringBuffer_.reset();
     callbackBuffer_.reset();
     dropBuffer_.reset();
     callbackBufferOffset_ = 0;
     callbackBufferValid_ = 0;
-    isCreated_.store(false);
     decodedFrameCount_.store(0, std::memory_order_relaxed);
     callbackFrameCount_.store(0, std::memory_order_relaxed);
     callbackSilenceCount_.store(0, std::memory_order_relaxed);
+    callbackPlcCount_.store(0, std::memory_order_relaxed);
+    callbackDrainCount_.store(0, std::memory_order_relaxed);
+    consecutivePlcCount_ = 0;
     LOGI("Destroyed");
 }
 
@@ -94,8 +109,9 @@ int OboePlaybackEngine::getBufferedFrameCount() const {
 }
 
 int OboePlaybackEngine::getXRunCount() const {
-    if (!stream_) return 0;
-    auto result = stream_->getXRunCount();
+    auto s = stream_;  // Local copy prevents TOCTOU if stream_ is reset concurrently
+    if (!s) return 0;
+    auto result = s->getXRunCount();
     return (result.value() > 0) ? result.value() : 0;
 }
 
@@ -153,11 +169,50 @@ bool OboePlaybackEngine::openStream() {
 
 void OboePlaybackEngine::closeStream() {
     if (stream_) {
-        stream_->stop();
-        stream_->close();
-        stream_.reset();
+        stream_->close();  // close() internally stops — calling stop() first is unnecessary
         LOGI("Stream closed");
     }
+}
+
+bool OboePlaybackEngine::restartStream() {
+    if (!isCreated_.load()) return false;
+
+    std::lock_guard<std::mutex> lock(streamLock_);
+    LOGI("Restarting stream for audio routing change");
+
+    isPlaying_.store(false);
+    closeStream();
+    stream_.reset();
+
+    // Reset partial-frame state so the new stream's callback starts clean.
+    // Stale offsets from the old stream could cause corrupted audio.
+    callbackBufferOffset_ = 0;
+    callbackBufferValid_ = 0;
+
+    // Drain excess frames to prevent latency accumulation.
+    // During stream restart, packets keep arriving but the callback isn't
+    // consuming — each toggle adds ~200-400ms of undrained audio. Drain to
+    // prebuffer level so the new stream starts near real-time.
+    if (ringBuffer_) {
+        int before = ringBuffer_->availableFrames();
+        if (before > prebufferFrames_) {
+            ringBuffer_->drain(prebufferFrames_);
+            LOGI("Drained buffer: %d -> %d frames", before, ringBuffer_->availableFrames());
+        }
+    }
+
+    bool ok = openStream();
+    if (!ok) {
+        // HAL may not be ready immediately after audio route change.
+        // Brief retry — 100ms is enough for most HALs to settle.
+        LOGW("First open attempt failed, retrying after 100ms");
+        usleep(100000);
+        ok = openStream();
+        if (!ok) {
+            LOGE("Stream restart failed after retry");
+        }
+    }
+    return ok;
 }
 
 // --- Oboe audio callback (runs on SCHED_FIFO thread) ---
@@ -170,12 +225,35 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
     auto* output = static_cast<int16_t*>(audioData);
     int32_t totalSamples = numFrames * channels_;
 
+    // Guard against callback firing after destroy() on OpenSL ES legacy path
+    if (destroyed_.load(std::memory_order_acquire)) {
+        std::memset(output, 0, sizeof(int16_t) * totalSamples);
+        return oboe::DataCallbackResult::Stop;
+    }
+
     // Phase 3: Mute outputs silence, ring buffer continues accumulating
     if (playbackMuted_.load(std::memory_order_relaxed)) {
         std::memset(output, 0, sizeof(int16_t) * totalSamples);
         return isPlaying_.load(std::memory_order_relaxed)
             ? oboe::DataCallbackResult::Continue
             : oboe::DataCallbackResult::Stop;
+    }
+
+    // Adaptive playout: skip excess frames to bound latency.
+    // Packet bursts (Reticulum delivers multiple frames at once) cause the
+    // buffer to grow. Without drain, the buffer level ratchets up because
+    // the average arrival rate matches the consumption rate — bursts add
+    // frames but there's never a deficit to drain them back. Skip frames
+    // when the buffer exceeds 2× prebuffer to keep latency bounded.
+    if (ringBuffer_ && prebufferFrames_ > 0) {
+        int buffered = ringBuffer_->availableFrames();
+        int maxTarget = prebufferFrames_ * 2;
+        if (buffered > maxTarget) {
+            ringBuffer_->drain(prebufferFrames_);
+            callbackBufferOffset_ = 0;
+            callbackBufferValid_ = 0;
+            callbackDrainCount_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     int32_t samplesWritten = 0;
@@ -214,6 +292,7 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
             if (ringBuffer_->read(output + samplesWritten, frameSamples_)) {
                 samplesWritten += frameSamples_;
                 callbackFrameCount_.fetch_add(1, std::memory_order_relaxed);
+                consecutivePlcCount_ = 0;
             } else {
                 break;  // Ring buffer empty
             }
@@ -228,18 +307,57 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
                 callbackBufferOffset_ = remaining;
                 callbackBufferValid_ = frameSamples_;
                 callbackFrameCount_.fetch_add(1, std::memory_order_relaxed);
+                consecutivePlcCount_ = 0;
             } else {
                 break;  // Ring buffer empty
             }
         }
     }
 
-    // Fill remaining output with silence (underrun)
+    // Fill remaining output with PLC or silence (underrun)
     if (samplesWritten < totalSamples) {
-        std::memset(output + samplesWritten, 0,
-                   sizeof(int16_t) * (totalSamples - samplesWritten));
-        if (samplesWritten == 0) {
-            callbackSilenceCount_.fetch_add(1, std::memory_order_relaxed);
+        bool usedPlc = false;
+
+        // Try Opus PLC if decoder is available and we haven't exhausted PLC quality
+        if (decoder_ && decoder_->type() == CodecType::OPUS
+                && consecutivePlcCount_ < 5) {
+            // Non-blocking try-lock: if writeEncodedPacket() holds the lock,
+            // fall through to silence (near-zero contention in practice since
+            // empty buffer means packets aren't arriving).
+            if (!decoderLock_.test_and_set(std::memory_order_acquire)) {
+                // Re-check decoder_ inside the lock — destroyDecoder() acquires
+                // the lock before resetting, so if we're here it's still valid.
+                int plcSamples = decoder_
+                    ? decoder_->decodePlc(callbackBuffer_.get(), frameSamples_ / channels_)
+                    : -1;
+                decoderLock_.clear(std::memory_order_release);
+
+                if (plcSamples > 0) {
+                    // Copy PLC samples to output, handling partial frame
+                    int remaining = totalSamples - samplesWritten;
+                    int toCopy = (remaining < plcSamples) ? remaining : plcSamples;
+                    std::memcpy(output + samplesWritten, callbackBuffer_.get(),
+                               sizeof(int16_t) * toCopy);
+                    samplesWritten += toCopy;
+                    consecutivePlcCount_++;
+                    callbackPlcCount_.fetch_add(1, std::memory_order_relaxed);
+                    usedPlc = true;
+
+                    // If PLC didn't fill everything, zero the rest
+                    if (samplesWritten < totalSamples) {
+                        std::memset(output + samplesWritten, 0,
+                                   sizeof(int16_t) * (totalSamples - samplesWritten));
+                    }
+                }
+            }
+        }
+
+        if (!usedPlc) {
+            std::memset(output + samplesWritten, 0,
+                       sizeof(int16_t) * (totalSamples - samplesWritten));
+            if (samplesWritten == 0) {
+                callbackSilenceCount_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -284,8 +402,19 @@ bool OboePlaybackEngine::configureDecoder(int codecType, int sampleRate, int cha
 bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
     if (!decoder_ || !ringBuffer_ || !decodeBuf_) return false;
 
+    // Acquire decoder lock with bounded spin. PLC hold time is microseconds
+    // so contention is near-zero. Bounded spin prevents theoretical priority
+    // inversion stall if SCHED_FIFO callback is preempted while holding lock.
+    int spins = 0;
+    while (decoderLock_.test_and_set(std::memory_order_acquire)) {
+        if (++spins > 200) {
+            // PLC is taking unusually long — skip this packet rather than stall
+            return false;
+        }
+    }
     int decodedSamples = decoder_->decode(data, length,
                                           decodeBuf_.get(), decodeBufSize_);
+    decoderLock_.clear(std::memory_order_release);
     if (decodedSamples <= 0) {
         static int errCount = 0;
         if (++errCount <= 5) {
@@ -309,8 +438,10 @@ bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
         int buf = ringBuffer_->availableFrames();
         int cb = callbackFrameCount_.load(std::memory_order_relaxed);
         int sil = callbackSilenceCount_.load(std::memory_order_relaxed);
-        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d",
-             count, decodedSamples, length, buf, cb, sil);
+        int plc = callbackPlcCount_.load(std::memory_order_relaxed);
+        int drn = callbackDrainCount_.load(std::memory_order_relaxed);
+        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d cbPlc=%d cbDrain=%d",
+             count, decodedSamples, length, buf, cb, sil, plc, drn);
     }
 
     // Write decoded PCM into the existing ring buffer
@@ -322,7 +453,11 @@ void OboePlaybackEngine::setPlaybackMute(bool mute) {
 }
 
 void OboePlaybackEngine::destroyDecoder() {
+    // Acquire decoder lock so the PLC callback path (which re-checks decoder_
+    // inside the lock) never sees a half-destroyed decoder.
+    while (decoderLock_.test_and_set(std::memory_order_acquire)) { /* spin */ }
     decoder_.reset();
+    decoderLock_.clear(std::memory_order_release);
     decodeBuf_.reset();
     decodeBufSize_ = 0;
 }
@@ -334,9 +469,26 @@ void OboePlaybackEngine::onErrorAfterClose(
         oboe::Result error) {
     LOGW("Stream error: %s — attempting restart", oboe::convertToText(error));
 
-    // Standard Oboe recovery pattern: reopen the stream.
-    // This handles headphone plug/unplug, BT disconnect, etc.
-    if (isPlaying_.load()) {
-        openStream();
+    if (destroyed_.load(std::memory_order_acquire) || !isCreated_.load()) {
+        LOGI("Skipping error recovery — engine destroyed or not created");
+        return;
     }
+
+    // Serialize with restartStream()/stopStream() to prevent double-open race.
+    std::lock_guard<std::mutex> lock(streamLock_);
+
+    // Re-check after acquiring lock — restartStream() may have already recovered.
+    if (isPlaying_.load() || destroyed_.load(std::memory_order_acquire)) {
+        LOGI("Skipping error recovery — stream already recovered or engine destroyed");
+        return;
+    }
+
+    // Reset old stream and try to reopen
+    stream_.reset();
+    callbackBufferOffset_ = 0;
+    callbackBufferValid_ = 0;
+    if (ringBuffer_) {
+        ringBuffer_->drain(prebufferFrames_);
+    }
+    openStream();
 }

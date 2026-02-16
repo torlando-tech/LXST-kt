@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import tech.torlando.lxst.audio.NativePlaybackEngine
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -767,6 +768,17 @@ class AudioDevice(
         // current routing state from the system at creation time.
         if (isPlaying.get()) {
             restartAudioTrack()
+        }
+
+        // Restart native Oboe stream for voice call audio (OboeLineSink).
+        // Oboe streams bind to a hardware device at open time and don't follow
+        // system routing changes — must close and reopen to pick up new routing.
+        // Don't gate on isPlaying() — restartStream() handles the not-created
+        // case internally, and gating here prevents recovery if the stream died.
+        try {
+            NativePlaybackEngine.restartStream()
+        } catch (_: UnsatisfiedLinkError) {
+            // Native library not loaded — no Oboe stream to restart
         }
     }
 

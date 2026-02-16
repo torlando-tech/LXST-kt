@@ -8,6 +8,7 @@
 #include <oboe/Oboe.h>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include "packet_ring_buffer.h"
 #include "codec_wrapper.h"
 
@@ -103,6 +104,9 @@ public:
     /** Callbacks that output full silence (ring buffer empty). */
     int getCallbackSilenceCount() const { return callbackSilenceCount_.load(std::memory_order_relaxed); }
 
+    /** Callbacks that used Opus PLC instead of silence. */
+    int getCallbackPlcCount() const { return callbackPlcCount_.load(std::memory_order_relaxed); }
+
     // --- Phase 3: Native codec integration ---
 
     /**
@@ -165,6 +169,18 @@ private:
     bool openStream();
     void closeStream();
 
+public:
+    /**
+     * Close and reopen the Oboe stream to pick up audio routing changes.
+     *
+     * Called when the speaker/earpiece toggle changes — many HALs (especially
+     * Samsung low-end OpenSL ES) don't dynamically re-route already-open streams.
+     *
+     * @return true if the stream was successfully restarted
+     */
+    bool restartStream();
+
+private:
     int sampleRate_ = 0;
     int channels_ = 0;
     int frameSamples_ = 0;     // Samples per LXST frame
@@ -172,9 +188,11 @@ private:
 
     std::unique_ptr<PacketRingBuffer> ringBuffer_;
     std::shared_ptr<oboe::AudioStream> stream_;
+    std::mutex streamLock_;  // Serializes stream lifecycle (open/close/restart)
 
     std::atomic<bool> isPlaying_{false};
     std::atomic<bool> isCreated_{false};
+    std::atomic<bool> destroyed_{false};
 
     // Partial frame tracking — handles burst size < LXST frame size.
     // When the Oboe callback requests fewer samples than one LXST frame,
@@ -196,10 +214,21 @@ private:
     int decodeBufSize_ = 0;                     // Size of decodeBuf_ in samples
     std::atomic<bool> playbackMuted_{false};
 
+    // PLC (Packet Loss Concealment)
+    // Non-blocking try-lock for decoder access from the SCHED_FIFO callback.
+    // When the ring buffer is empty, the callback can try to generate PLC audio
+    // from the Opus decoder state. The lock prevents concurrent access with
+    // writeEncodedPacket() on the IO thread (contention is near-zero since
+    // empty buffer means packets aren't arriving).
+    std::atomic_flag decoderLock_ = ATOMIC_FLAG_INIT;
+    int consecutivePlcCount_ = 0;  // Callback-thread-only, no atomics needed
+
     // Diagnostics
     std::atomic<int> decodedFrameCount_{0};   // Frames decoded via writeEncodedPacket
     std::atomic<int> callbackFrameCount_{0};  // Frames served to Oboe callback
     std::atomic<int> callbackSilenceCount_{0}; // Callbacks that output silence (underrun)
+    std::atomic<int> callbackPlcCount_{0};     // Callbacks that used Opus PLC
+    std::atomic<int> callbackDrainCount_{0};   // Adaptive drain events in callback
 };
 
 #endif // LXST_OBOE_PLAYBACK_ENGINE_H

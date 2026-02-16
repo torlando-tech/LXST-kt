@@ -80,6 +80,22 @@ public:
                int16_t* output, int maxOutputSamples);
 
     /**
+     * Generate Packet Loss Concealment (PLC) audio from decoder state.
+     *
+     * Opus: calls opus_decode(NULL, 0, ...) which extrapolates plausible
+     * continuation audio from the decoder's internal state. Much better
+     * than hard silence for short gaps (1-5 frames).
+     *
+     * Codec2: returns -1 (no PLC support).
+     * NONE: returns -1.
+     *
+     * @param output            Output PCM int16 buffer
+     * @param samplesPerChannel Samples per channel to generate (e.g., 2880 for MQ)
+     * @return Decoded sample count (total, including all channels), or -1 if unsupported
+     */
+    int decodePlc(int16_t* output, int samplesPerChannel);
+
+    /**
      * Encode PCM int16 to encoded bytes.
      *
      * Codec2: prepends mode header byte, loops over sub-frames.

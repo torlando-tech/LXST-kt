@@ -483,10 +483,15 @@ class Telephone(
             }
 
             signal == Signalling.STATUS_AVAILABLE -> {
-                // Matches Python __available(): if in active call, treat as hangup
+                // Matches Python __available(): if in active call, treat as hangup.
+                // MUST use scope.launch (async) — this signal can arrive from
+                // Python __link_closed() via _send_signal_to_kotlin(), and hangup()
+                // runs heavy NativePlaybackEngine cleanup. Running synchronously
+                // would block the Python thread, holding _call_handler_lock for
+                // the entire duration and preventing subsequent call() attempts.
                 if (callStatus > Signalling.STATUS_AVAILABLE) {
                     Log.d(TAG, "Line available during active call, ending call")
-                    hangup()
+                    scope.launch { hangup() }
                 } else {
                     Log.d(TAG, "Line available")
                     callStatus = signal
