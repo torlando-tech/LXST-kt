@@ -110,6 +110,9 @@ object NativePlaybackEngine {
     /** Callbacks that output full silence due to empty ring buffer (diagnostic). */
     fun getCallbackSilenceCount(): Int = nativeGetCallbackSilenceCount()
 
+    /** Callbacks that used Opus PLC instead of silence (diagnostic). */
+    fun getCallbackPlcCount(): Int = nativeGetCallbackPlcCount()
+
     // --- Phase 3: Native codec methods ---
 
     /**
@@ -227,4 +230,6 @@ object NativePlaybackEngine {
     private external fun nativeGetCallbackFrameCount(): Int
 
     private external fun nativeGetCallbackSilenceCount(): Int
+
+    private external fun nativeGetCallbackPlcCount(): Int
 }

@@ -91,6 +91,8 @@ void OboePlaybackEngine::destroy() {
     decodedFrameCount_.store(0, std::memory_order_relaxed);
     callbackFrameCount_.store(0, std::memory_order_relaxed);
     callbackSilenceCount_.store(0, std::memory_order_relaxed);
+    callbackPlcCount_.store(0, std::memory_order_relaxed);
+    consecutivePlcCount_ = 0;
     LOGI("Destroyed");
 }
 
@@ -233,6 +235,7 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
             if (ringBuffer_->read(output + samplesWritten, frameSamples_)) {
                 samplesWritten += frameSamples_;
                 callbackFrameCount_.fetch_add(1, std::memory_order_relaxed);
+                consecutivePlcCount_ = 0;
             } else {
                 break;  // Ring buffer empty
             }
@@ -247,18 +250,54 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
                 callbackBufferOffset_ = remaining;
                 callbackBufferValid_ = frameSamples_;
                 callbackFrameCount_.fetch_add(1, std::memory_order_relaxed);
+                consecutivePlcCount_ = 0;
             } else {
                 break;  // Ring buffer empty
             }
         }
     }
 
-    // Fill remaining output with silence (underrun)
+    // Fill remaining output with PLC or silence (underrun)
     if (samplesWritten < totalSamples) {
-        std::memset(output + samplesWritten, 0,
-                   sizeof(int16_t) * (totalSamples - samplesWritten));
-        if (samplesWritten == 0) {
-            callbackSilenceCount_.fetch_add(1, std::memory_order_relaxed);
+        bool usedPlc = false;
+
+        // Try Opus PLC if decoder is available and we haven't exhausted PLC quality
+        if (decoder_ && decoder_->type() == CodecType::OPUS
+                && consecutivePlcCount_ < 5) {
+            // Non-blocking try-lock: if writeEncodedPacket() holds the lock,
+            // fall through to silence (near-zero contention in practice since
+            // empty buffer means packets aren't arriving).
+            if (!decoderLock_.test_and_set(std::memory_order_acquire)) {
+                int plcSamples = decoder_->decodePlc(
+                    callbackBuffer_.get(), frameSamples_ / channels_);
+                decoderLock_.clear(std::memory_order_release);
+
+                if (plcSamples > 0) {
+                    // Copy PLC samples to output, handling partial frame
+                    int remaining = totalSamples - samplesWritten;
+                    int toCopy = (remaining < plcSamples) ? remaining : plcSamples;
+                    std::memcpy(output + samplesWritten, callbackBuffer_.get(),
+                               sizeof(int16_t) * toCopy);
+                    samplesWritten += toCopy;
+                    consecutivePlcCount_++;
+                    callbackPlcCount_.fetch_add(1, std::memory_order_relaxed);
+                    usedPlc = true;
+
+                    // If PLC didn't fill everything, zero the rest
+                    if (samplesWritten < totalSamples) {
+                        std::memset(output + samplesWritten, 0,
+                                   sizeof(int16_t) * (totalSamples - samplesWritten));
+                    }
+                }
+            }
+        }
+
+        if (!usedPlc) {
+            std::memset(output + samplesWritten, 0,
+                       sizeof(int16_t) * (totalSamples - samplesWritten));
+            if (samplesWritten == 0) {
+                callbackSilenceCount_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -303,8 +342,13 @@ bool OboePlaybackEngine::configureDecoder(int codecType, int sampleRate, int cha
 bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
     if (!decoder_ || !ringBuffer_ || !decodeBuf_) return false;
 
+    // Acquire decoder lock (spin is fine — not real-time thread, and PLC
+    // hold time is microseconds). Prevents concurrent access with PLC in
+    // the Oboe callback.
+    while (decoderLock_.test_and_set(std::memory_order_acquire)) { /* spin */ }
     int decodedSamples = decoder_->decode(data, length,
                                           decodeBuf_.get(), decodeBufSize_);
+    decoderLock_.clear(std::memory_order_release);
     if (decodedSamples <= 0) {
         static int errCount = 0;
         if (++errCount <= 5) {
@@ -328,8 +372,9 @@ bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
         int buf = ringBuffer_->availableFrames();
         int cb = callbackFrameCount_.load(std::memory_order_relaxed);
         int sil = callbackSilenceCount_.load(std::memory_order_relaxed);
-        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d",
-             count, decodedSamples, length, buf, cb, sil);
+        int plc = callbackPlcCount_.load(std::memory_order_relaxed);
+        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d cbPlc=%d",
+             count, decodedSamples, length, buf, cb, sil, plc);
     }
 
     // Write decoded PCM into the existing ring buffer

@@ -56,10 +56,12 @@ class LinkSource(
          *
          * Used by [computePrebufferFrames] to calculate the number of decoded
          * frames to accumulate before auto-starting the Oboe playback stream.
-         * Must be large enough to absorb Reticulum network jitter (~100-150ms)
-         * plus Oboe startup latency.
+         * Must be large enough to absorb Reticulum network jitter (~100-185ms RTT)
+         * plus Oboe startup latency. 450ms provides ~7 frames for MQ (60ms),
+         * trading ~150ms additional one-way latency for significantly less
+         * ring buffer starvation on high-jitter links.
          */
-        const val PREBUFFER_TARGET_MS = 300
+        const val PREBUFFER_TARGET_MS = 450
 
         /**
          * Compute the prebuffer frame count for a given profile frame time.

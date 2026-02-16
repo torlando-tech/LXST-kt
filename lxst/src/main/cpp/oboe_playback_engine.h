@@ -103,6 +103,9 @@ public:
     /** Callbacks that output full silence (ring buffer empty). */
     int getCallbackSilenceCount() const { return callbackSilenceCount_.load(std::memory_order_relaxed); }
 
+    /** Callbacks that used Opus PLC instead of silence. */
+    int getCallbackPlcCount() const { return callbackPlcCount_.load(std::memory_order_relaxed); }
+
     // --- Phase 3: Native codec integration ---
 
     /**
@@ -209,10 +212,20 @@ private:
     int decodeBufSize_ = 0;                     // Size of decodeBuf_ in samples
     std::atomic<bool> playbackMuted_{false};
 
+    // PLC (Packet Loss Concealment)
+    // Non-blocking try-lock for decoder access from the SCHED_FIFO callback.
+    // When the ring buffer is empty, the callback can try to generate PLC audio
+    // from the Opus decoder state. The lock prevents concurrent access with
+    // writeEncodedPacket() on the IO thread (contention is near-zero since
+    // empty buffer means packets aren't arriving).
+    std::atomic_flag decoderLock_ = ATOMIC_FLAG_INIT;
+    int consecutivePlcCount_ = 0;  // Callback-thread-only, no atomics needed
+
     // Diagnostics
     std::atomic<int> decodedFrameCount_{0};   // Frames decoded via writeEncodedPacket
     std::atomic<int> callbackFrameCount_{0};  // Frames served to Oboe callback
     std::atomic<int> callbackSilenceCount_{0}; // Callbacks that output silence (underrun)
+    std::atomic<int> callbackPlcCount_{0};     // Callbacks that used Opus PLC
 };
 
 #endif // LXST_OBOE_PLAYBACK_ENGINE_H

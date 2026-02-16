@@ -213,4 +213,13 @@ Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeGetCallbackSilenceCount
     return sEngine->getCallbackSilenceCount();
 }
 
+JNIEXPORT jint JNICALL
+Java_tech_torlando_lxst_audio_NativePlaybackEngine_nativeGetCallbackPlcCount(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
+    if (!sEngine) return 0;
+    return sEngine->getCallbackPlcCount();
+}
+
 } // extern "C"
