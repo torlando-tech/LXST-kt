@@ -228,6 +228,7 @@ private:
     std::atomic<int> callbackFrameCount_{0};  // Frames served to Oboe callback
     std::atomic<int> callbackSilenceCount_{0}; // Callbacks that output silence (underrun)
     std::atomic<int> callbackPlcCount_{0};     // Callbacks that used Opus PLC
+    std::atomic<int> callbackDrainCount_{0};   // Adaptive drain events in callback
 };
 
 #endif // LXST_OBOE_PLAYBACK_ENGINE_H

@@ -64,6 +64,18 @@ public:
     /** Reset buffer to empty state. Not thread-safe — call only when idle. */
     void reset();
 
+    /**
+     * Discard frames to keep at most framesToKeep in the buffer.
+     *
+     * Advances readIndex_ without copying data. Safe to call from the
+     * consumer thread (or when the consumer is stopped). The producer
+     * only reads readIndex_ to check capacity, so an advanced read
+     * index simply appears as "more space available".
+     *
+     * @param framesToKeep Maximum frames to retain (excess are discarded)
+     */
+    void drain(int framesToKeep);
+
 private:
     const int maxFrames_;
     const int frameSamples_;

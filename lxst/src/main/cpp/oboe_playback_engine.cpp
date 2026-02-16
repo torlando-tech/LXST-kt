@@ -99,6 +99,7 @@ void OboePlaybackEngine::destroy() {
     callbackFrameCount_.store(0, std::memory_order_relaxed);
     callbackSilenceCount_.store(0, std::memory_order_relaxed);
     callbackPlcCount_.store(0, std::memory_order_relaxed);
+    callbackDrainCount_.store(0, std::memory_order_relaxed);
     consecutivePlcCount_ = 0;
     LOGI("Destroyed");
 }
@@ -188,6 +189,18 @@ bool OboePlaybackEngine::restartStream() {
     callbackBufferOffset_ = 0;
     callbackBufferValid_ = 0;
 
+    // Drain excess frames to prevent latency accumulation.
+    // During stream restart, packets keep arriving but the callback isn't
+    // consuming — each toggle adds ~200-400ms of undrained audio. Drain to
+    // prebuffer level so the new stream starts near real-time.
+    if (ringBuffer_) {
+        int before = ringBuffer_->availableFrames();
+        if (before > prebufferFrames_) {
+            ringBuffer_->drain(prebufferFrames_);
+            LOGI("Drained buffer: %d -> %d frames", before, ringBuffer_->availableFrames());
+        }
+    }
+
     bool ok = openStream();
     if (!ok) {
         // HAL may not be ready immediately after audio route change.
@@ -224,6 +237,23 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
         return isPlaying_.load(std::memory_order_relaxed)
             ? oboe::DataCallbackResult::Continue
             : oboe::DataCallbackResult::Stop;
+    }
+
+    // Adaptive playout: skip excess frames to bound latency.
+    // Packet bursts (Reticulum delivers multiple frames at once) cause the
+    // buffer to grow. Without drain, the buffer level ratchets up because
+    // the average arrival rate matches the consumption rate — bursts add
+    // frames but there's never a deficit to drain them back. Skip frames
+    // when the buffer exceeds 2× prebuffer to keep latency bounded.
+    if (ringBuffer_ && prebufferFrames_ > 0) {
+        int buffered = ringBuffer_->availableFrames();
+        int maxTarget = prebufferFrames_ * 2;
+        if (buffered > maxTarget) {
+            ringBuffer_->drain(prebufferFrames_);
+            callbackBufferOffset_ = 0;
+            callbackBufferValid_ = 0;
+            callbackDrainCount_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     int32_t samplesWritten = 0;
@@ -409,8 +439,9 @@ bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
         int cb = callbackFrameCount_.load(std::memory_order_relaxed);
         int sil = callbackSilenceCount_.load(std::memory_order_relaxed);
         int plc = callbackPlcCount_.load(std::memory_order_relaxed);
-        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d cbPlc=%d",
-             count, decodedSamples, length, buf, cb, sil, plc);
+        int drn = callbackDrainCount_.load(std::memory_order_relaxed);
+        LOGI("RX#%d: decoded=%d len=%d buf=%d cbServed=%d cbSilence=%d cbPlc=%d cbDrain=%d",
+             count, decodedSamples, length, buf, cb, sil, plc, drn);
     }
 
     // Write decoded PCM into the existing ring buffer
@@ -456,5 +487,8 @@ void OboePlaybackEngine::onErrorAfterClose(
     stream_.reset();
     callbackBufferOffset_ = 0;
     callbackBufferValid_ = 0;
+    if (ringBuffer_) {
+        ringBuffer_->drain(prebufferFrames_);
+    }
     openStream();
 }

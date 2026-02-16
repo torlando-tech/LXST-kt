@@ -60,3 +60,12 @@ void PacketRingBuffer::reset() {
     writeIndex_.store(0, std::memory_order_relaxed);
     readIndex_.store(0, std::memory_order_relaxed);
 }
+
+void PacketRingBuffer::drain(int framesToKeep) {
+    int avail = availableFrames();
+    int toDrain = avail - framesToKeep;
+    if (toDrain <= 0) return;
+
+    int r = readIndex_.load(std::memory_order_relaxed);
+    readIndex_.store((r + toDrain) % maxFrames_, std::memory_order_release);
+}
