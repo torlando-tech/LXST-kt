@@ -268,8 +268,11 @@ oboe::DataCallbackResult OboePlaybackEngine::onAudioReady(
             // fall through to silence (near-zero contention in practice since
             // empty buffer means packets aren't arriving).
             if (!decoderLock_.test_and_set(std::memory_order_acquire)) {
-                int plcSamples = decoder_->decodePlc(
-                    callbackBuffer_.get(), frameSamples_ / channels_);
+                // Re-check decoder_ inside the lock — destroyDecoder() acquires
+                // the lock before resetting, so if we're here it's still valid.
+                int plcSamples = decoder_
+                    ? decoder_->decodePlc(callbackBuffer_.get(), frameSamples_ / channels_)
+                    : -1;
                 decoderLock_.clear(std::memory_order_release);
 
                 if (plcSamples > 0) {
@@ -342,10 +345,16 @@ bool OboePlaybackEngine::configureDecoder(int codecType, int sampleRate, int cha
 bool OboePlaybackEngine::writeEncodedPacket(const uint8_t* data, int length) {
     if (!decoder_ || !ringBuffer_ || !decodeBuf_) return false;
 
-    // Acquire decoder lock (spin is fine — not real-time thread, and PLC
-    // hold time is microseconds). Prevents concurrent access with PLC in
-    // the Oboe callback.
-    while (decoderLock_.test_and_set(std::memory_order_acquire)) { /* spin */ }
+    // Acquire decoder lock with bounded spin. PLC hold time is microseconds
+    // so contention is near-zero. Bounded spin prevents theoretical priority
+    // inversion stall if SCHED_FIFO callback is preempted while holding lock.
+    int spins = 0;
+    while (decoderLock_.test_and_set(std::memory_order_acquire)) {
+        if (++spins > 200) {
+            // PLC is taking unusually long — skip this packet rather than stall
+            return false;
+        }
+    }
     int decodedSamples = decoder_->decode(data, length,
                                           decodeBuf_.get(), decodeBufSize_);
     decoderLock_.clear(std::memory_order_release);
@@ -386,7 +395,11 @@ void OboePlaybackEngine::setPlaybackMute(bool mute) {
 }
 
 void OboePlaybackEngine::destroyDecoder() {
+    // Acquire decoder lock so the PLC callback path (which re-checks decoder_
+    // inside the lock) never sees a half-destroyed decoder.
+    while (decoderLock_.test_and_set(std::memory_order_acquire)) { /* spin */ }
     decoder_.reset();
+    decoderLock_.clear(std::memory_order_release);
     decodeBuf_.reset();
     decodeBufSize_ = 0;
 }
