@@ -149,6 +149,23 @@ int CodecWrapper::decode(const uint8_t* encoded, int encodedBytes,
     return -1;  // NONE
 }
 
+int CodecWrapper::decodePlc(int16_t* output, int samplesPerChannel) {
+    if (type_ == CodecType::OPUS) {
+        if (!opusDec_) return -1;
+
+        int decoded = opus_decode(opusDec_, nullptr, 0,
+                                  output, samplesPerChannel, 0);
+        if (decoded < 0) {
+            LOGW("Opus PLC error: %s", opus_strerror(decoded));
+            return -1;
+        }
+        return decoded * channels_;  // Return total samples
+    }
+
+    // Codec2 and NONE have no PLC support
+    return -1;
+}
+
 int CodecWrapper::encode(const int16_t* pcm, int pcmSamples,
                          uint8_t* output, int maxOutputBytes) {
     if (type_ == CodecType::OPUS) {

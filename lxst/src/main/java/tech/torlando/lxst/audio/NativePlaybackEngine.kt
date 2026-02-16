@@ -72,6 +72,17 @@ object NativePlaybackEngine {
         return nativeStartStream()
     }
 
+    /**
+     * Close and reopen the Oboe stream to pick up audio routing changes.
+     *
+     * Called when the speaker/earpiece toggle changes so the native stream
+     * binds to the newly-routed audio device.
+     */
+    fun restartStream(): Boolean {
+        ensureLoaded()
+        return nativeRestartStream()
+    }
+
     /** Stop and close the Oboe output stream. */
     fun stopStream() {
         ensureLoaded()
@@ -98,6 +109,9 @@ object NativePlaybackEngine {
 
     /** Callbacks that output full silence due to empty ring buffer (diagnostic). */
     fun getCallbackSilenceCount(): Int = nativeGetCallbackSilenceCount()
+
+    /** Callbacks that used Opus PLC instead of silence (diagnostic). */
+    fun getCallbackPlcCount(): Int = nativeGetCallbackPlcCount()
 
     // --- Phase 3: Native codec methods ---
 
@@ -179,6 +193,8 @@ object NativePlaybackEngine {
 
     private external fun nativeStartStream(): Boolean
 
+    private external fun nativeRestartStream(): Boolean
+
     private external fun nativeStopStream()
 
     private external fun nativeDestroy()
@@ -214,4 +230,6 @@ object NativePlaybackEngine {
     private external fun nativeGetCallbackFrameCount(): Int
 
     private external fun nativeGetCallbackSilenceCount(): Int
+
+    private external fun nativeGetCallbackPlcCount(): Int
 }
