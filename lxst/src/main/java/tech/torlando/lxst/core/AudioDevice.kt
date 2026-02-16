@@ -770,13 +770,13 @@ class AudioDevice(
             restartAudioTrack()
         }
 
-        // Restart native Oboe stream if playing (voice call audio via OboeLineSink).
+        // Restart native Oboe stream for voice call audio (OboeLineSink).
         // Oboe streams bind to a hardware device at open time and don't follow
         // system routing changes — must close and reopen to pick up new routing.
+        // Don't gate on isPlaying() — restartStream() handles the not-created
+        // case internally, and gating here prevents recovery if the stream died.
         try {
-            if (NativePlaybackEngine.isPlaying()) {
-                NativePlaybackEngine.restartStream()
-            }
+            NativePlaybackEngine.restartStream()
         } catch (_: UnsatisfiedLinkError) {
             // Native library not loaded — no Oboe stream to restart
         }

@@ -5,6 +5,7 @@
 #include "oboe_playback_engine.h"
 #include <android/log.h>
 #include <cstring>
+#include <unistd.h>
 
 #define LOG_TAG "LXST:OboeEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -62,6 +63,8 @@ bool OboePlaybackEngine::startStream() {
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(streamLock_);
+
     if (isPlaying_.load()) {
         LOGW("Stream already playing");
         return true;
@@ -71,6 +74,7 @@ bool OboePlaybackEngine::startStream() {
 }
 
 void OboePlaybackEngine::stopStream() {
+    std::lock_guard<std::mutex> lock(streamLock_);
     isPlaying_.store(false);
     closeStream();
     stream_.reset();
@@ -78,16 +82,19 @@ void OboePlaybackEngine::stopStream() {
 
 void OboePlaybackEngine::destroy() {
     destroyed_.store(true, std::memory_order_release);
-    isPlaying_.store(false);
-    closeStream();
-    stream_.reset();       // Safe now — close() has returned and destroyed_ guards callback
+    isCreated_.store(false);  // Prevent restartStream/onErrorAfterClose from reopening
+    {
+        std::lock_guard<std::mutex> lock(streamLock_);
+        isPlaying_.store(false);
+        closeStream();
+        stream_.reset();
+    }
     destroyDecoder();
     ringBuffer_.reset();
     callbackBuffer_.reset();
     dropBuffer_.reset();
     callbackBufferOffset_ = 0;
     callbackBufferValid_ = 0;
-    isCreated_.store(false);
     decodedFrameCount_.store(0, std::memory_order_relaxed);
     callbackFrameCount_.store(0, std::memory_order_relaxed);
     callbackSilenceCount_.store(0, std::memory_order_relaxed);
@@ -167,12 +174,32 @@ void OboePlaybackEngine::closeStream() {
 }
 
 bool OboePlaybackEngine::restartStream() {
-    if (!isPlaying_.load()) return false;
+    if (!isCreated_.load()) return false;
+
+    std::lock_guard<std::mutex> lock(streamLock_);
     LOGI("Restarting stream for audio routing change");
+
     isPlaying_.store(false);
     closeStream();
     stream_.reset();
-    return openStream();  // restores isPlaying_ = true on success
+
+    // Reset partial-frame state so the new stream's callback starts clean.
+    // Stale offsets from the old stream could cause corrupted audio.
+    callbackBufferOffset_ = 0;
+    callbackBufferValid_ = 0;
+
+    bool ok = openStream();
+    if (!ok) {
+        // HAL may not be ready immediately after audio route change.
+        // Brief retry — 100ms is enough for most HALs to settle.
+        LOGW("First open attempt failed, retrying after 100ms");
+        usleep(100000);
+        ok = openStream();
+        if (!ok) {
+            LOGE("Stream restart failed after retry");
+        }
+    }
+    return ok;
 }
 
 // --- Oboe audio callback (runs on SCHED_FIFO thread) ---
@@ -411,9 +438,23 @@ void OboePlaybackEngine::onErrorAfterClose(
         oboe::Result error) {
     LOGW("Stream error: %s — attempting restart", oboe::convertToText(error));
 
-    // Standard Oboe recovery pattern: reopen the stream.
-    // This handles headphone plug/unplug, BT disconnect, etc.
-    if (isPlaying_.load()) {
-        openStream();
+    if (destroyed_.load(std::memory_order_acquire) || !isCreated_.load()) {
+        LOGI("Skipping error recovery — engine destroyed or not created");
+        return;
     }
+
+    // Serialize with restartStream()/stopStream() to prevent double-open race.
+    std::lock_guard<std::mutex> lock(streamLock_);
+
+    // Re-check after acquiring lock — restartStream() may have already recovered.
+    if (isPlaying_.load() || destroyed_.load(std::memory_order_acquire)) {
+        LOGI("Skipping error recovery — stream already recovered or engine destroyed");
+        return;
+    }
+
+    // Reset old stream and try to reopen
+    stream_.reset();
+    callbackBufferOffset_ = 0;
+    callbackBufferValid_ = 0;
+    openStream();
 }

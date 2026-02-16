@@ -8,6 +8,7 @@
 #include <oboe/Oboe.h>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include "packet_ring_buffer.h"
 #include "codec_wrapper.h"
 
@@ -187,6 +188,7 @@ private:
 
     std::unique_ptr<PacketRingBuffer> ringBuffer_;
     std::shared_ptr<oboe::AudioStream> stream_;
+    std::mutex streamLock_;  // Serializes stream lifecycle (open/close/restart)
 
     std::atomic<bool> isPlaying_{false};
     std::atomic<bool> isCreated_{false};
