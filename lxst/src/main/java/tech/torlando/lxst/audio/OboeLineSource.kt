@@ -260,7 +260,7 @@ class OboeLineSource(
 
     /** Phase 3: Read encoded packets, prepend header, send via PacketRouter */
     private suspend fun ingestJobNativeCodec() {
-        Log.d(TAG, "Ingest job started (native codec mode)")
+        Log.i(TAG, "Ingest job started (native codec mode) hdr=0x${(codecHeaderByte.toInt() and 0xFF).toString(16)}")
         val encodedBuf = ByteArray(1500) // Pre-allocated, reused each iteration
         var frameCount = 0L
 
@@ -275,17 +275,25 @@ class OboeLineSource(
                 encodedBuf.copyInto(packet, 1, 0, len)
                 packetRouter?.sendPacket(packet)
 
-                if (frameCount <= 5L) {
-                    Log.d(TAG, "TX native #$frameCount: ${packet.size} bytes, hdr=0x${(codecHeaderByte.toInt() and 0xFF).toString(16)}")
-                } else if (frameCount % 100L == 0L) {
-                    Log.d(TAG, "TX native #$frameCount")
+                // Log frequently at start (every frame for first 30, then every 10)
+                if (frameCount <= 30L || frameCount % 10L == 0L) {
+                    val toc = if (len > 0) encodedBuf[0].toInt() and 0xFF else 0
+                    val config = toc shr 3
+                    val stereo = (toc shr 2) and 1
+                    val code = toc and 0x3
+                    val hex = (0 until minOf(8, len)).joinToString(" ") {
+                        String.format("%02x", encodedBuf[it].toInt() and 0xFF)
+                    }
+                    Log.i(TAG, "TX-DIAG kt#$frameCount: ${packet.size}B TOC=0x${toc.toString(16)} " +
+                        "cfg=$config ${if (stereo == 1) "S" else "M"} code=$code " +
+                        "router=${packetRouter != null} first8=[$hex]")
                 }
             } else {
                 delay(2)
             }
         }
 
-        Log.d(TAG, "Ingest job ended (native codec), sent $frameCount frames")
+        Log.i(TAG, "Ingest job ended (native codec), sent $frameCount frames")
     }
 
     /**

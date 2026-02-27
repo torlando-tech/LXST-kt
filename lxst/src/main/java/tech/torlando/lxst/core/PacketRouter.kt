@@ -96,8 +96,10 @@ class PacketRouter private constructor(
                     } else {
                         handler.receiveAudioPacket(packet)
                         consumerDeliveryCount++
-                        if (consumerDeliveryCount <= 5 || consumerDeliveryCount % 100 == 0) {
-                            Log.w(TAG, "Consumer delivered #$consumerDeliveryCount (${packet.size} bytes)")
+                        if (consumerDeliveryCount <= 30 || consumerDeliveryCount % 10 == 0) {
+                            val hdr = if (packet.isNotEmpty()) String.format("0x%02x", packet[0].toInt() and 0xFF) else "?"
+                            val toc = if (packet.size > 1) String.format("0x%02x", packet[1].toInt() and 0xFF) else "?"
+                            Log.i(TAG, "TX-DIAG router#$consumerDeliveryCount: ${packet.size}B hdr=$hdr toc=$toc → handler")
                         }
                     }
                 } catch (e: Exception) {

@@ -171,6 +171,19 @@ int CodecWrapper::encode(const int16_t* pcm, int pcmSamples,
     if (type_ == CodecType::OPUS) {
         if (!opusEnc_) return -1;
 
+        static int encDiagCount = 0;
+        encDiagCount++;
+        bool shouldLog = (encDiagCount <= 30) || (encDiagCount % 10 == 0);
+
+        // Compute input peak for diagnostics
+        int16_t inputPeak = 0;
+        if (shouldLog) {
+            for (int i = 0; i < pcmSamples; i++) {
+                int16_t v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+                if (v > inputPeak) inputPeak = v;
+            }
+        }
+
         // Handle mono→stereo upmix for stereo profiles (e.g., SHQ)
         // Capture is always mono; if codec expects stereo, duplicate samples
         const int16_t* encodeInput = pcm;
@@ -190,6 +203,19 @@ int CodecWrapper::encode(const int16_t* pcm, int pcmSamples,
         }
 
         int framesPerChannel = encodeSamples / channels_;
+
+        if (shouldLog) {
+            // Also compute peak of the actual buffer going to opus_encode
+            int16_t encodePeak = 0;
+            for (int i = 0; i < encodeSamples; i++) {
+                int16_t v = encodeInput[i] < 0 ? -encodeInput[i] : encodeInput[i];
+                if (v > encodePeak) encodePeak = v;
+            }
+            LOGI("TX-DIAG codec#%d: inSamples=%d inPeak=%d ch=%d upmixed=%d encPeak=%d fpc=%d",
+                 encDiagCount, pcmSamples, inputPeak, channels_,
+                 (encodeInput == stereoBuf) ? 1 : 0, encodePeak, framesPerChannel);
+        }
+
         int encoded = opus_encode(opusEnc_, encodeInput, framesPerChannel,
                                   output, maxOutputBytes);
         if (encoded < 0) {

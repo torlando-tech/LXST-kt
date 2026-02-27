@@ -10,6 +10,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 OboeCaptureEngine::OboeCaptureEngine() = default;
 
@@ -181,10 +182,25 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
 
         if (accumCount_ == frameSamples_) {
             // Full LXST frame accumulated
+            static int diagCount = 0;
+            diagCount++;
+
+            // Log frequently at start (every frame for first 30, then every 10)
+            bool shouldLog = (diagCount <= 30) || (diagCount % 10 == 0);
+
+            // DIAG: peak of raw accumulation buffer (before mute/filter)
+            int16_t preMutePeak = 0;
+            if (shouldLog) {
+                for (int di = 0; di < frameSamples_; di++) {
+                    int16_t v = accumBuffer_[di] < 0 ? -accumBuffer_[di] : accumBuffer_[di];
+                    if (v > preMutePeak) preMutePeak = v;
+                }
+            }
 
             // Apply mute: replace with silence if capture is muted
             int16_t* frameData = accumBuffer_.get();
-            if (captureMuted_.load(std::memory_order_relaxed)) {
+            bool isMuted = captureMuted_.load(std::memory_order_relaxed);
+            if (isMuted) {
                 if (silenceBuf_) {
                     frameData = silenceBuf_.get();
                 } else {
@@ -197,10 +213,29 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
                 filterChain_->process(frameData, frameSamples_, sampleRate_);
             }
 
+            // DIAG: peak after mute+filter
+            int16_t postFilterPeak = 0;
+            if (shouldLog) {
+                for (int di = 0; di < frameSamples_; di++) {
+                    int16_t v = frameData[di] < 0 ? -frameData[di] : frameData[di];
+                    if (v > postFilterPeak) postFilterPeak = v;
+                }
+                LOGI("TX-DIAG cap#%d: rawPeak=%d muted=%d filtPeak=%d samples=%d sr=%d ch=%d encCb=%d",
+                     diagCount, preMutePeak, isMuted ? 1 : 0, postFilterPeak, frameSamples_,
+                     sampleRate_, channels_, encodeInCallback_ ? 1 : 0);
+            }
+
             if (encodeInCallback_ && encoder_ && encodedRingBuffer_) {
                 // Phase 3: Encode directly in callback → encoded ring buffer
                 int encodedLen = encoder_->encode(frameData, frameSamples_,
                                                   encodeBuf_, sizeof(encodeBuf_));
+                // DIAG: log encode result with first bytes
+                if (shouldLog && encodedLen > 0) {
+                    LOGI("TX-DIAG enc#%d: len=%d TOC=0x%02x bytes=[%02x %02x %02x %02x]",
+                         diagCount, encodedLen, encodeBuf_[0],
+                         encodeBuf_[0], encodedLen > 1 ? encodeBuf_[1] : 0,
+                         encodedLen > 2 ? encodeBuf_[2] : 0, encodedLen > 3 ? encodeBuf_[3] : 0);
+                }
                 if (encodedLen > 0) {
                     if (!encodedRingBuffer_->write(encodeBuf_, encodedLen)) {
                         // Encoded ring buffer full — drop (consumer too slow)
@@ -209,6 +244,8 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
                         encodedRingBuffer_->read(discard, 1, &discardLen);
                         encodedRingBuffer_->write(encodeBuf_, encodedLen);
                     }
+                } else if (shouldLog) {
+                    LOGW("TX-DIAG enc#%d: ENCODE FAILED len=%d", diagCount, encodedLen);
                 }
             } else {
                 // Phase 2: Write raw PCM to ring buffer
