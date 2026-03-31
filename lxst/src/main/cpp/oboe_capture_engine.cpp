@@ -130,7 +130,7 @@ bool OboeCaptureEngine::openStream() {
          stream_->getBufferCapacityInFrames());
 
     if (stream_->getSampleRate() != sampleRate_) {
-        LOGW("Capture stream rate mismatch: got %d, requested %d — SRC should handle this",
+        LOGI("Capture stream: SRC active, HAL rate=%d, codec rate=%d",
              stream_->getSampleRate(), sampleRate_);
     }
 
