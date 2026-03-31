@@ -110,6 +110,7 @@ bool OboeCaptureEngine::openStream() {
            ->setSampleRate(sampleRate_)
            ->setChannelCount(channels_)
            ->setInputPreset(oboe::InputPreset::VoiceCommunication)
+           ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
            ->setDataCallback(this)
            ->setErrorCallback(this);
 
@@ -120,12 +121,18 @@ bool OboeCaptureEngine::openStream() {
         return false;
     }
 
-    LOGI("Input stream opened: API=%s, rate=%d, ch=%d, framesPerBurst=%d, bufferCapacity=%d",
+    LOGI("Input stream opened: API=%s, rate=%d (requested=%d), ch=%d, framesPerBurst=%d, bufferCapacity=%d",
          stream_->getAudioApi() == oboe::AudioApi::AAudio ? "AAudio" : "OpenSLES",
          stream_->getSampleRate(),
+         sampleRate_,
          stream_->getChannelCount(),
          stream_->getFramesPerBurst(),
          stream_->getBufferCapacityInFrames());
+
+    if (stream_->getSampleRate() != sampleRate_) {
+        LOGW("Capture stream rate mismatch: got %d, requested %d — SRC should handle this",
+             stream_->getSampleRate(), sampleRate_);
+    }
 
     // Set isRecording_ BEFORE requestStart() to avoid a race condition:
     // The SCHED_FIFO callback can fire immediately after requestStart(),

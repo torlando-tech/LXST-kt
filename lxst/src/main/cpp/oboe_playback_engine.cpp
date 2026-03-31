@@ -128,6 +128,7 @@ bool OboePlaybackEngine::openStream() {
            ->setChannelCount(channels_)
            ->setUsage(oboe::Usage::VoiceCommunication)
            ->setContentType(oboe::ContentType::Speech)
+           ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
            ->setDataCallback(this)
            ->setErrorCallback(this);
 
@@ -138,12 +139,18 @@ bool OboePlaybackEngine::openStream() {
         return false;
     }
 
-    LOGI("Stream opened: API=%s, rate=%d, ch=%d, framesPerBurst=%d, bufferCapacity=%d",
+    LOGI("Stream opened: API=%s, rate=%d (requested=%d), ch=%d, framesPerBurst=%d, bufferCapacity=%d",
          stream_->getAudioApi() == oboe::AudioApi::AAudio ? "AAudio" : "OpenSLES",
          stream_->getSampleRate(),
+         sampleRate_,
          stream_->getChannelCount(),
          stream_->getFramesPerBurst(),
          stream_->getBufferCapacityInFrames());
+
+    if (stream_->getSampleRate() != sampleRate_) {
+        LOGW("Playback stream rate mismatch: got %d, requested %d — SRC should handle this",
+             stream_->getSampleRate(), sampleRate_);
+    }
 
     // Set buffer size to 2x burst for low latency while avoiding underruns
     auto burstSize = stream_->getFramesPerBurst();
