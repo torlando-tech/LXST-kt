@@ -1,13 +1,12 @@
 plugins {
     id("com.android.library")
-    kotlin("android")
 }
 
 group = "tech.torlando"
 
 android {
     namespace = "tech.torlando.lxst"
-    compileSdk = 35
+    compileSdk = 36
 
     buildFeatures {
         prefab = true
