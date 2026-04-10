@@ -4,7 +4,6 @@
 
 package tech.torlando.lxst.audio
 
-import tech.torlando.lxst.core.AudioDevice
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
@@ -12,6 +11,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import tech.torlando.lxst.core.AudioDevice
+import java.util.concurrent.LinkedBlockingQueue
 
 /**
  * Unit tests for LineSink queue management logic.
@@ -20,6 +21,12 @@ import org.junit.Test
  * Uses mocked AudioDevice to avoid JNI dependencies.
  */
 class LineSinkTest {
+
+    private companion object {
+        const val SAMPLE_RATE_48K = 48_000
+        const val MONO_CHANNELS = 1
+        const val FRAME_SIZE_60MS_48K = 2_880
+    }
 
     private lateinit var mockBridge: AudioDevice
     private lateinit var sink: LineSink
@@ -32,7 +39,7 @@ class LineSinkTest {
         sink = LineSink(
             bridge = mockBridge,
             autodigest = false,
-            lowLatency = false
+            lowLatency = false,
         )
     }
 
@@ -43,52 +50,55 @@ class LineSinkTest {
 
     @Test
     fun `canReceive returns true below threshold`() {
-        // bufferMaxHeight = MAX_FRAMES - 1; add one fewer than that
-        repeat(LineSink.MAX_FRAMES - 2) {
-            sink.handleFrame(FloatArray(480))
+        sink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
+        val effectiveMaxFrames = effectiveMaxFrames(FRAME_SIZE_60MS_48K, SAMPLE_RATE_48K)
+
+        repeat(effectiveMaxFrames - 2) {
+            sink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K))
         }
         assertTrue(sink.canReceive())
     }
 
     @Test
     fun `canReceive returns false at threshold`() {
-        // bufferMaxHeight = MAX_FRAMES - 1; fill to exactly that
-        repeat(LineSink.MAX_FRAMES - 1) {
-            sink.handleFrame(FloatArray(480))
+        sink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
+        val effectiveMaxFrames = effectiveMaxFrames(FRAME_SIZE_60MS_48K, SAMPLE_RATE_48K)
+
+        repeat(effectiveMaxFrames - 1) {
+            sink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K))
         }
         assertFalse(sink.canReceive())
     }
 
     @Test
     fun `handleFrame adds frame to queue`() {
-        val frame = FloatArray(480) { it.toFloat() }
-        sink.handleFrame(frame)
+        sink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
+        sink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K) { it.toFloat() })
 
-        // Queue should have 1 frame - still has room
         assertTrue(sink.canReceive())
     }
 
     @Test
-    fun `handleFrame drops oldest on overflow`() {
-        // Fill queue completely (MAX_FRAMES = 6)
-        repeat(LineSink.MAX_FRAMES) {
-            sink.handleFrame(FloatArray(480) { it.toFloat() })
+    fun `handleFrame drops oldest on physical queue overflow`() {
+        sink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
+        val queue = frameQueue(sink)
+        val firstFrame = FloatArray(FRAME_SIZE_60MS_48K) { -1f }
+        sink.handleFrame(firstFrame)
+
+        repeat(LineSink.MAX_QUEUE_SLOTS - 1) {
+            sink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K) { it.toFloat() })
         }
 
-        // Add one more - should drop oldest
-        val newFrame = FloatArray(480) { 999f }
+        val newFrame = FloatArray(FRAME_SIZE_60MS_48K) { 999f }
         sink.handleFrame(newFrame)
 
-        // Queue should still be at MAX_FRAMES (not MAX_FRAMES + 1)
-        // We can't directly check queue contents, but we can verify no exception
-        assertFalse(sink.canReceive()) // Still at/above threshold
+        assertTrue(queue.size == LineSink.MAX_QUEUE_SLOTS)
+        assertFalse(queue.peek().contentEquals(firstFrame))
     }
 
     @Test
     fun `configure sets sample rate and channels`() {
         sink.configure(sampleRate = 8000, channels = 1)
-        // Configuration is internal, but affects start() behavior
-        // We verify it doesn't throw
     }
 
     @Test
@@ -98,42 +108,34 @@ class LineSinkTest {
 
     @Test
     fun `stop clears queue`() {
-        sink.configure(48000, 1)
+        sink.configure(48_000, 1)
 
-        // Add some frames
         repeat(3) {
-            sink.handleFrame(FloatArray(480))
+            sink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K))
         }
 
-        // Start then stop
         sink.start()
         sink.stop()
 
-        // Queue should be empty now
         assertTrue(sink.canReceive())
-
         sink.release()
     }
 
     @Test
     fun `autodigest starts playback when threshold reached`() {
-        // Create sink with autodigest=true
         val autoSink = LineSink(
             bridge = mockBridge,
             autodigest = true,
-            lowLatency = false
+            lowLatency = false,
         )
-        autoSink.configure(48000, 1)
+        autoSink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
+        val autostartMin = effectiveAutostartMin(FRAME_SIZE_60MS_48K, SAMPLE_RATE_48K)
 
-        // Add AUTOSTART_MIN frames to trigger autostart
-        repeat(LineSink.AUTOSTART_MIN) {
-            autoSink.handleFrame(FloatArray(480))
+        repeat(autostartMin) {
+            autoSink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K))
         }
 
-        // Should have auto-started
         assertTrue(autoSink.isRunning())
-
-        // Cleanup
         autoSink.stop()
         autoSink.release()
     }
@@ -143,18 +145,20 @@ class LineSinkTest {
         val lowLatencySink = LineSink(
             bridge = mockBridge,
             autodigest = false,
-            lowLatency = true
+            lowLatency = true,
         )
-        lowLatencySink.configure(48000, 1)
+        lowLatencySink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
         lowLatencySink.start()
-        Thread.sleep(50) // Allow async startPlayback coroutine to execute
+        Thread.sleep(50)
 
         verify {
             mockBridge.startPlayback(
-                sampleRate = 48000,
-                channels = 1,
-                lowLatency = true
+                sampleRate = SAMPLE_RATE_48K,
+                channels = MONO_CHANNELS,
+                lowLatency = true,
+                autoPlay = false,
             )
+            mockBridge.beginPlayback()
         }
 
         lowLatencySink.stop()
@@ -165,14 +169,16 @@ class LineSinkTest {
     fun `start calls bridge with configured parameters`() {
         sink.configure(8000, 1)
         sink.start()
-        Thread.sleep(50) // Allow async startPlayback coroutine to execute
+        Thread.sleep(50)
 
         verify {
             mockBridge.startPlayback(
                 sampleRate = 8000,
                 channels = 1,
-                lowLatency = false
+                lowLatency = false,
+                autoPlay = false,
             )
+            mockBridge.beginPlayback()
         }
 
         sink.stop()
@@ -181,7 +187,7 @@ class LineSinkTest {
 
     @Test
     fun `stop calls bridge stopPlayback`() {
-        sink.configure(48000, 1)
+        sink.configure(48_000, 1)
         sink.start()
         sink.stop()
 
@@ -191,7 +197,7 @@ class LineSinkTest {
 
     @Test
     fun `isRunning returns true after start`() {
-        sink.configure(48000, 1)
+        sink.configure(48_000, 1)
         sink.start()
         assertTrue(sink.isRunning())
 
@@ -201,7 +207,7 @@ class LineSinkTest {
 
     @Test
     fun `isRunning returns false after stop`() {
-        sink.configure(48000, 1)
+        sink.configure(48_000, 1)
         sink.start()
         sink.stop()
         assertFalse(sink.isRunning())
@@ -211,43 +217,35 @@ class LineSinkTest {
 
     @Test
     fun `start drains excess frames accumulated during AudioTrack creation`() {
-        // Simulate slow AudioTrack creation: startPlayback blocks for 200ms
-        // while handleFrame keeps queuing frames on another thread.
         every {
-            mockBridge.startPlayback(any(), any(), any())
+            mockBridge.startPlayback(any(), any(), any(), any())
         } answers {
-            Thread.sleep(200) // Simulate AudioTrack init delay
+            Thread.sleep(200)
         }
 
         val autoSink = LineSink(
             bridge = mockBridge,
             autodigest = false,
-            lowLatency = false
+            lowLatency = false,
         )
-        autoSink.configure(48000, 1)
+        autoSink.configure(SAMPLE_RATE_48K, MONO_CHANNELS)
+        val autostartMin = effectiveAutostartMin(FRAME_SIZE_60MS_48K, SAMPLE_RATE_48K)
 
-        // Pre-fill AUTOSTART_MIN frames (normal pre-fill)
-        repeat(LineSink.AUTOSTART_MIN) {
-            autoSink.handleFrame(FloatArray(2880))
+        repeat(autostartMin) {
+            autoSink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K))
         }
 
-        // Start playback (will block ~200ms in startPlayback)
         autoSink.start()
 
-        // While startPlayback blocks, simulate network delivering more frames
         Thread {
             repeat(8) {
-                Thread.sleep(20) // ~60ms frame intervals
-                autoSink.handleFrame(FloatArray(2880))
+                Thread.sleep(20)
+                autoSink.handleFrame(FloatArray(FRAME_SIZE_60MS_48K))
             }
         }.start()
 
-        // Wait for start coroutine to finish and begin digestJob
         Thread.sleep(400)
 
-        // The drain should have removed excess frames, keeping only AUTOSTART_MIN.
-        // Verify writeAudio was called (digestJob started) — if drain didn't work,
-        // first N writes would be stale frames causing delay.
         verify(atLeast = 1) { mockBridge.writeAudio(any()) }
 
         autoSink.stop()
@@ -257,24 +255,46 @@ class LineSinkTest {
     @Test
     fun `handleFrame detects sample rate from source`() {
         val mockSource = mockk<Source>(relaxed = true)
-        every { mockSource.sampleRate } returns 16000
+        every { mockSource.sampleRate } returns 16_000
         every { mockSource.channels } returns 1
 
         sink.handleFrame(FloatArray(320), mockSource)
-
-        // Start should use detected sample rate
         sink.start()
-        Thread.sleep(50) // Allow async startPlayback coroutine to execute
+        Thread.sleep(50)
 
         verify {
             mockBridge.startPlayback(
-                sampleRate = 16000,
+                sampleRate = 16_000,
                 channels = 1,
-                lowLatency = false
+                lowLatency = false,
+                autoPlay = false,
             )
+            mockBridge.beginPlayback()
         }
 
         sink.stop()
         sink.release()
+    }
+
+    private fun effectiveMaxFrames(frameSize: Int, sampleRate: Int, channels: Int = MONO_CHANNELS): Int {
+        val frameTimeMs = ((frameSize.toFloat() / (sampleRate * channels)) * 1000).toLong().coerceAtLeast(1L)
+        return (LineSink.BUFFER_CAPACITY_MS / frameTimeMs)
+            .toInt()
+            .coerceIn(LineSink.MAX_FRAMES, LineSink.MAX_QUEUE_SLOTS)
+    }
+
+    private fun effectiveAutostartMin(frameSize: Int, sampleRate: Int, channels: Int = MONO_CHANNELS): Int {
+        val frameTimeMs = ((frameSize.toFloat() / (sampleRate * channels)) * 1000).toLong().coerceAtLeast(1L)
+        val maxFrames = effectiveMaxFrames(frameSize, sampleRate, channels)
+        return (LineSink.PREBUFFER_MS / frameTimeMs)
+            .toInt()
+            .coerceIn(LineSink.AUTOSTART_MIN, maxFrames / 2)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun frameQueue(sink: LineSink): LinkedBlockingQueue<FloatArray> {
+        val field = sink.javaClass.getDeclaredField("frameQueue")
+        field.isAccessible = true
+        return field.get(sink) as LinkedBlockingQueue<FloatArray>
     }
 }
