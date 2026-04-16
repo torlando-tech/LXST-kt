@@ -1,8 +1,10 @@
 plugins {
     id("com.android.library")
+    `maven-publish`
 }
 
-group = "tech.torlando"
+group = "com.github.torlando-tech.LXST-kt"
+version = System.getenv("VERSION")?.removePrefix("v") ?: "0.1.0-SNAPSHOT"
 
 android {
     namespace = "tech.torlando.lxst"
@@ -48,6 +50,36 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
+        }
+    }
+
+    publishing {
+        singleVariant("release") { withSourcesJar() }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+                pom {
+                    name.set("LXST-kt")
+                    description.set("LXST telephony stack: Oboe audio pipeline, codec2/opus, Reticulum link transport.")
+                    url.set("https://github.com/torlando-tech/LXST-kt")
+                    licenses {
+                        license {
+                            name.set("Mozilla Public License 2.0")
+                            url.set("https://www.mozilla.org/en-US/MPL/2.0/")
+                        }
+                    }
+                    scm {
+                        connection.set("scm:git:https://github.com/torlando-tech/LXST-kt.git")
+                        developerConnection.set("scm:git:git@github.com:torlando-tech/LXST-kt.git")
+                        url.set("https://github.com/torlando-tech/LXST-kt")
+                    }
+                }
+            }
         }
     }
 }
