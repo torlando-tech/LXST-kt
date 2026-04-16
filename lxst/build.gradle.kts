@@ -1,8 +1,10 @@
 plugins {
     id("com.android.library")
+    `maven-publish`
 }
 
-group = "tech.torlando"
+group = "com.github.torlando-tech.LXST-kt"
+version = System.getenv("VERSION")?.removePrefix("v") ?: "0.1.0-SNAPSHOT"
 
 android {
     namespace = "tech.torlando.lxst"
@@ -48,6 +50,18 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
+        }
+    }
+
+    publishing {
+        singleVariant("release") { withSourcesJar() }
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") { from(components["release"]) }
         }
     }
 }
