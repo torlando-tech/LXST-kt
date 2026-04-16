@@ -61,7 +61,25 @@ android {
 afterEvaluate {
     publishing {
         publications {
-            create<MavenPublication>("release") { from(components["release"]) }
+            create<MavenPublication>("release") {
+                from(components["release"])
+                pom {
+                    name.set("LXST-kt")
+                    description.set("LXST telephony stack: Oboe audio pipeline, codec2/opus, Reticulum link transport.")
+                    url.set("https://github.com/torlando-tech/LXST-kt")
+                    licenses {
+                        license {
+                            name.set("Mozilla Public License 2.0")
+                            url.set("https://www.mozilla.org/en-US/MPL/2.0/")
+                        }
+                    }
+                    scm {
+                        connection.set("scm:git:https://github.com/torlando-tech/LXST-kt.git")
+                        developerConnection.set("scm:git:git@github.com:torlando-tech/LXST-kt.git")
+                        url.set("https://github.com/torlando-tech/LXST-kt")
+                    }
+                }
+            }
         }
     }
 }

@@ -1,4 +1,4 @@
 jdk:
   - openjdk21
 install:
-  - ./gradlew clean publishToMavenLocal -x test
+  - ./gradlew clean :lxst:publishToMavenLocal -x test
