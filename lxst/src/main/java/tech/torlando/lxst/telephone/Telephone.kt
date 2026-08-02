@@ -8,13 +8,16 @@ import android.content.Context
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicLong
 import tech.torlando.lxst.audio.LineSink
 import tech.torlando.lxst.audio.LineSource
 import tech.torlando.lxst.audio.LinkSource
@@ -64,7 +67,7 @@ import tech.torlando.lxst.core.PacketRouter
  * @param useNativePlayback Use Oboe native playback (true) or legacy AudioTrack (false)
  * @param useNativeCodec Use native C++ Opus/Codec2 (true) or Kotlin codec (false). Requires useNativePlayback.
  */
-class Telephone(
+class Telephone private constructor(
     private val context: Context,
     private val networkTransport: NetworkTransport,
     private val audioBridge: AudioDevice,
@@ -74,6 +77,7 @@ class Telephone(
     private val waitTime: Long = WAIT_TIME_MS,
     private val useNativePlayback: Boolean = true,
     private val useNativeCodec: Boolean = true,
+    private val coroutineDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
     companion object {
         private const val TAG = "Columba:Telephone"
@@ -89,6 +93,54 @@ class Telephone(
         const val DIAL_TONE_GAIN = 0.04f
         const val BUSY_TONE_SECONDS = 4.25f
     }
+
+    constructor(
+        context: Context,
+        networkTransport: NetworkTransport,
+        audioBridge: AudioDevice,
+        networkPacketBridge: PacketRouter,
+        callBridge: CallCoordinator,
+        ringTime: Long = RING_TIME_MS,
+        waitTime: Long = WAIT_TIME_MS,
+        useNativePlayback: Boolean = true,
+        useNativeCodec: Boolean = true,
+    ) : this(
+        context = context,
+        networkTransport = networkTransport,
+        audioBridge = audioBridge,
+        networkPacketBridge = networkPacketBridge,
+        callBridge = callBridge,
+        ringTime = ringTime,
+        waitTime = waitTime,
+        useNativePlayback = useNativePlayback,
+        useNativeCodec = useNativeCodec,
+        coroutineDispatcher = Dispatchers.Default,
+    )
+
+    internal constructor(
+        context: Context,
+        networkTransport: NetworkTransport,
+        audioBridge: AudioDevice,
+        networkPacketBridge: PacketRouter,
+        callBridge: CallCoordinator,
+        ringTime: Long,
+        waitTime: Long,
+        useNativePlayback: Boolean,
+        useNativeCodec: Boolean,
+        coroutineDispatcher: CoroutineDispatcher,
+        @Suppress("UNUSED_PARAMETER") testOnly: Unit,
+    ) : this(
+        context = context,
+        networkTransport = networkTransport,
+        audioBridge = audioBridge,
+        networkPacketBridge = networkPacketBridge,
+        callBridge = callBridge,
+        ringTime = ringTime,
+        waitTime = waitTime,
+        useNativePlayback = useNativePlayback,
+        useNativeCodec = useNativeCodec,
+        coroutineDispatcher = coroutineDispatcher,
+    )
 
     // ===== State (matches Python Telephony.py lines 159-180) =====
 
@@ -152,12 +204,15 @@ class Telephone(
 
     /** Job controlling ring tone pattern loop */
     private var ringToneJob: Job? = null
+    private var ringToneStartupJob: Job? = null
 
     // ===== Coroutine Management =====
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val scope = CoroutineScope(coroutineDispatcher + SupervisorJob())
     private var dialToneJob: Job? = null
     private var timeoutJob: Job? = null
+    private val callGeneration = AtomicLong(0)
+    private val callStateLock = Any()
 
     init {
         // Wire up signal callback to handle incoming signals
@@ -180,34 +235,36 @@ class Telephone(
         destinationHash: ByteArray,
         profile: Profile = Profile.DEFAULT,
     ) {
-        if (isCallActive()) {
+        val destinationIdentity = destinationHash.toHexString()
+        val generation =
+            synchronized(callStateLock) {
+                if (isCallActive()) {
+                    null
+                } else {
+                    callStatus = Signalling.STATUS_CALLING
+                    activeProfile = profile
+                    isIncomingCall = false
+                    remoteIdentityHash = destinationIdentity
+                    val acceptedGeneration = callGeneration.incrementAndGet()
+
+                    callBridge.setConnecting(destinationIdentity)
+                    timeoutJob?.cancel()
+                    timeoutJob =
+                        scope.launch {
+                            delay(waitTime)
+                            hangupIfCurrent(acceptedGeneration) {
+                                callStatus < Signalling.STATUS_ESTABLISHED
+                            }
+                        }
+                    acceptedGeneration
+                }
+            }
+        if (generation == null) {
             Log.w(TAG, "Already in call, ignoring")
             return
         }
 
-        Log.i(TAG, "Initiating call to ${destinationHash.toHexString().take(16)}...")
-
-        callStatus = Signalling.STATUS_CALLING
-        activeProfile = profile
-        isIncomingCall = false
-        remoteIdentityHash = destinationHash.toHexString()
-
-        // Notify UI
-        callBridge.setConnecting(remoteIdentityHash!!)
-
-        // Cancel any stale timeout from a previous call that ended without hangup()
-        // (e.g., link closed → STATUS_AVAILABLE with callStatus=CALLING skips hangup)
-        timeoutJob?.cancel()
-
-        // Start outgoing call timeout
-        timeoutJob =
-            scope.launch {
-                delay(waitTime)
-                if (callStatus < Signalling.STATUS_ESTABLISHED) {
-                    Log.w(TAG, "Outgoing call timeout after ${waitTime}ms")
-                    hangup()
-                }
-            }
+        Log.i(TAG, "Initiating call to ${destinationIdentity.take(16)}...")
 
         // Establish link via NetworkTransport
         val linkEstablished =
@@ -217,7 +274,7 @@ class Telephone(
 
         if (linkEstablished != true) {
             Log.w(TAG, "Link establishment failed or timed out")
-            hangup()
+            hangupIfCurrent(generation)
             return
         }
 
@@ -230,7 +287,9 @@ class Telephone(
      *
      * Matches Python Telephony.py answer() (lines 404-423).
      */
-    fun answer(): Boolean {
+    fun answer(): Boolean = synchronized(callStateLock) { answerLocked() }
+
+    private fun answerLocked(): Boolean {
         if (!isIncomingCall || callStatus != Signalling.STATUS_RINGING) {
             Log.w(
                 TAG,
@@ -270,6 +329,26 @@ class Telephone(
      * @param reason Optional reason code (STATUS_BUSY, STATUS_REJECTED)
      */
     fun hangup(reason: Int? = null) {
+        synchronized(callStateLock) {
+            hangupLocked(reason)
+        }
+    }
+
+    private fun hangupIfCurrent(
+        generation: Long,
+        reason: Int? = null,
+        predicate: () -> Boolean = { true },
+    ): Boolean =
+        synchronized(callStateLock) {
+            if (callGeneration.get() != generation || !predicate()) {
+                false
+            } else {
+                hangupLocked(reason)
+                true
+            }
+        }
+
+    private fun hangupLocked(reason: Int?) {
         Log.i(TAG, "Hanging up call (reason=$reason)")
 
         // Cancel timeout
@@ -335,6 +414,33 @@ class Telephone(
             else -> callBridge.onCallEnded(previousIdentity)
         }
     }
+
+    private inline fun withCurrentGeneration(
+        generation: Long,
+        action: () -> Unit,
+    ): Boolean = withCurrentGenerationIf(generation, predicate = { true }, action = action)
+
+    private inline fun withCurrentGenerationIf(
+        generation: Long,
+        predicate: () -> Boolean,
+        action: () -> Unit,
+    ): Boolean =
+        synchronized(callStateLock) {
+            if (callGeneration.get() != generation || !predicate()) {
+                false
+            } else {
+                action()
+                true
+            }
+        }
+
+    private inline fun isCurrentGenerationAnd(
+        generation: Long,
+        predicate: () -> Boolean,
+    ): Boolean =
+        synchronized(callStateLock) {
+            callGeneration.get() == generation && predicate()
+        }
 
     /**
      * Switch quality profile during active call.
@@ -459,26 +565,31 @@ class Telephone(
      * ahead of openPipelines(), leaving pipeline components created but never
      * started — no audio flows.
      */
-    @Synchronized
     private fun onSignalReceived(signal: Int) {
+        synchronized(callStateLock) {
+            onSignalReceivedLocked(signal)
+        }
+    }
+
+    private fun onSignalReceivedLocked(signal: Int) {
         Log.d(TAG, "Signal received: 0x${signal.toString(16)} (status=$callStatus)")
 
         when {
             signal == Signalling.STATUS_BUSY -> {
                 Log.d(TAG, "Remote is busy")
+                val generation = callGeneration.get()
                 scope.launch {
-                    playBusyTone()
-                    disableDialTone()
-                    hangup(reason = Signalling.STATUS_BUSY)
+                    playBusyTone(generation)
+                    hangupIfCurrent(generation, reason = Signalling.STATUS_BUSY)
                 }
             }
 
             signal == Signalling.STATUS_REJECTED -> {
                 Log.d(TAG, "Remote rejected call")
+                val generation = callGeneration.get()
                 scope.launch {
-                    playBusyTone()
-                    disableDialTone()
-                    hangup(reason = Signalling.STATUS_REJECTED)
+                    playBusyTone(generation)
+                    hangupIfCurrent(generation, reason = Signalling.STATUS_REJECTED)
                 }
             }
 
@@ -491,7 +602,8 @@ class Telephone(
                 // the entire duration and preventing subsequent call() attempts.
                 if (callStatus > Signalling.STATUS_AVAILABLE) {
                     Log.d(TAG, "Line available during active call, ending call")
-                    scope.launch { hangup() }
+                    val generation = callGeneration.get()
+                    scope.launch { hangupIfCurrent(generation) }
                 } else {
                     Log.d(TAG, "Line available")
                     callStatus = signal
@@ -512,7 +624,7 @@ class Telephone(
                 } else {
                     // Incoming call: we are ringing
                     prepareDiallingPipelines()
-                    activateRingTone()
+                    activateRingTone(callGeneration.get())
                 }
             }
 
@@ -566,38 +678,38 @@ class Telephone(
     fun onIncomingCall(identityHash: String) {
         Log.i(TAG, "Incoming call from ${identityHash.take(16)}...")
 
-        if (isCallActive()) {
+        val generation =
+            synchronized(callStateLock) {
+                if (isCallActive()) {
+                    null
+                } else {
+                    isIncomingCall = true
+                    remoteIdentityHash = identityHash
+                    callStatus = Signalling.STATUS_RINGING
+                    val acceptedGeneration = callGeneration.incrementAndGet()
+
+                    prepareDiallingPipelines()
+                    activateRingTone(acceptedGeneration)
+                    callBridge.onIncomingCall(identityHash)
+                    timeoutJob?.cancel()
+                    timeoutJob =
+                        scope.launch {
+                            delay(ringTime)
+                            hangupIfCurrent(acceptedGeneration) {
+                                callStatus == Signalling.STATUS_RINGING
+                            }
+                        }
+                    acceptedGeneration
+                }
+            }
+        if (generation == null) {
             Log.w(TAG, "Already in call, signalling busy")
             networkTransport.sendSignal(Signalling.STATUS_BUSY)
             return
         }
 
-        isIncomingCall = true
-        remoteIdentityHash = identityHash
-        callStatus = Signalling.STATUS_RINGING
-
-        // Prepare for ringing
-        prepareDiallingPipelines()
-
         // Note: Python call_manager already sends STATUS_RINGING to remote
         // before calling this method. No need to send it again.
-
-        // Activate ring tone
-        activateRingTone()
-
-        // Notify UI
-        callBridge.onIncomingCall(identityHash)
-
-        // Start ring timeout (cancel any stale timeout first)
-        timeoutJob?.cancel()
-        timeoutJob =
-            scope.launch {
-                delay(ringTime)
-                if (callStatus == Signalling.STATUS_RINGING) {
-                    Log.w(TAG, "Ring timeout after ${ringTime}ms")
-                    hangup()
-                }
-            }
     }
 
     /**
@@ -609,14 +721,23 @@ class Telephone(
      * timeout — those have already happened through Python's direct CallCoordinator call.
      */
     fun prepareForAnswer(identityHash: String) {
-        if (isCallActive()) {
+        val accepted =
+            synchronized(callStateLock) {
+                if (isCallActive()) {
+                    false
+                } else {
+                    isIncomingCall = true
+                    remoteIdentityHash = identityHash
+                    callStatus = Signalling.STATUS_RINGING
+                    callGeneration.incrementAndGet()
+                    true
+                }
+            }
+        if (!accepted) {
             Log.w(TAG, "Cannot prepareForAnswer: already in call")
             return
         }
         Log.i(TAG, "prepareForAnswer: setting up state for ${identityHash.take(16)}...")
-        isIncomingCall = true
-        remoteIdentityHash = identityHash
-        callStatus = Signalling.STATUS_RINGING
     }
 
     // ===== Pipeline Management (matches Python Telephony.py) =====
@@ -711,10 +832,11 @@ class Telephone(
     private fun openPipelinesPhase2() {
         // Create packetizer (transmit to network)
         if (packetizer == null) {
+            val generation = callGeneration.get()
             packetizer =
                 Packetizer(
                     bridge = networkPacketBridge,
-                    failureCallback = { onPacketizerFailure() },
+                    failureCallback = { onPacketizerFailure(generation) },
                 ).apply {
                     codec = activeProfile.createCodec()
                 }
@@ -1015,12 +1137,13 @@ class Telephone(
      * Uses system ringtone by default, falls back to ToneSource pattern.
      * Matches Python Telephony.py lines 526-539.
      */
-    private fun activateRingTone() {
+    private fun activateRingTone(generation: Long) {
         Log.d(TAG, "Activating ring tone (useSystemRingtone=$useSystemRingtone)")
 
         if (useSystemRingtone) {
             // Use Android RingtoneManager
-            scope.launch(Dispatchers.Main) {
+            ringToneStartupJob?.cancel()
+            ringToneStartupJob = scope.launch(Dispatchers.Main) {
                 try {
                     val uri =
                         if (customRingtonePath != null) {
@@ -1028,17 +1151,25 @@ class Telephone(
                         } else {
                             RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
                         }
-                    systemRingtone = RingtoneManager.getRingtone(context, uri)
-                    systemRingtone?.play()
-                    Log.d(TAG, "System ringtone started")
+                    val ringtone = RingtoneManager.getRingtone(context, uri)
+                    withCurrentGenerationIf(
+                        generation = generation,
+                        predicate = { isIncomingCall && callStatus == Signalling.STATUS_RINGING },
+                    ) {
+                        systemRingtone = ringtone
+                        ringtone?.play()
+                        Log.d(TAG, "System ringtone started")
+                    }
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to play system ringtone, using fallback tone", e)
-                    playToneRingPattern()
+                    playToneRingPattern(generation)
                 }
             }
         } else {
             // Use ToneSource pattern
-            playToneRingPattern()
+            playToneRingPattern(generation)
         }
     }
 
@@ -1048,49 +1179,67 @@ class Telephone(
      * Pattern: 2 seconds on, 4 seconds off (standard telephone ring).
      * Used as fallback when system ringtone unavailable.
      */
-    private fun playToneRingPattern() {
+    private fun playToneRingPattern(generation: Long) {
         Log.d(TAG, "Playing tone ring pattern")
 
-        ringToneJob?.cancel()
-        ringToneJob =
-            scope.launch {
+        withCurrentGenerationIf(
+            generation = generation,
+            predicate = { isIncomingCall && callStatus == Signalling.STATUS_RINGING },
+        ) {
+            ringToneJob?.cancel()
+            ringToneJob = scope.launch {
                 // Create ringer pipeline if needed (separate from main call pipeline)
-                if (ringerSink == null) {
-                    ringerSink = LineSink(bridge = audioBridge)
-                }
-                if (ringerMixer == null) {
-                    ringerMixer =
-                        Mixer(
-                            targetFrameMs = 60,
-                            sink = ringerSink,
-                        )
-                }
-                if (ringTone == null) {
-                    val ringerMixerAsSink = MixerSinkAdapter(ringerMixer!!)
-                    ringTone =
-                        ToneSource(
-                            frequency = DIAL_TONE_FREQUENCY,
-                            targetGain = 0.1f, // Louder than dial tone for ringtone
-                            ease = true,
-                            easeTimeMs = DIAL_TONE_EASE_MS,
-                        ).apply {
-                            sink = ringerMixerAsSink
+                val prepared =
+                    withCurrentGenerationIf(
+                        generation = generation,
+                        predicate = { isIncomingCall && callStatus == Signalling.STATUS_RINGING },
+                    ) {
+                        if (ringerSink == null) {
+                            ringerSink = LineSink(bridge = audioBridge)
                         }
-                }
+                        if (ringerMixer == null) {
+                            ringerMixer =
+                                Mixer(
+                                    targetFrameMs = 60,
+                                    sink = ringerSink,
+                                )
+                        }
+                        if (ringTone == null) {
+                            val ringerMixerAsSink = MixerSinkAdapter(ringerMixer!!)
+                            ringTone =
+                                ToneSource(
+                                    frequency = DIAL_TONE_FREQUENCY,
+                                    targetGain = 0.1f,
+                                    ease = true,
+                                    easeTimeMs = DIAL_TONE_EASE_MS,
+                                ).apply {
+                                    sink = ringerMixerAsSink
+                                }
+                        }
+                    }
+                if (!prepared) return@launch
 
                 // Ring pattern: 2s on, 4s off (standard telephone ring)
-                while (isIncomingCall && callStatus == Signalling.STATUS_RINGING) {
-                    ringerMixer?.start()
-                    ringTone?.start()
+                while (isCurrentGenerationAnd(generation) { isIncomingCall && callStatus == Signalling.STATUS_RINGING }) {
+                    if (!withCurrentGeneration(generation) {
+                            ringerMixer?.start()
+                            ringTone?.start()
+                        }
+                    ) {
+                        return@launch
+                    }
                     delay(2000)
-                    ringTone?.stop()
+                    if (!withCurrentGeneration(generation) { ringTone?.stop() }) return@launch
                     delay(4000)
                 }
 
                 // Cleanup when loop exits
-                ringTone?.stop()
-                ringerMixer?.stop()
+                withCurrentGeneration(generation) {
+                    ringTone?.stop()
+                    ringerMixer?.stop()
+                }
             }
+        }
     }
 
     /**
@@ -1100,6 +1249,9 @@ class Telephone(
      */
     private fun stopRingTone() {
         Log.d(TAG, "Stopping ring tone")
+
+        ringToneStartupJob?.cancel()
+        ringToneStartupJob = null
 
         // Stop system ringtone
         systemRingtone?.stop()
@@ -1161,15 +1313,19 @@ class Telephone(
      * Matches Python __play_busy_tone() (lines 541-551).
      * Pattern: 0.25s on, 0.25s off for BUSY_TONE_SECONDS.
      */
-    private suspend fun playBusyTone() {
+    private suspend fun playBusyTone(generation: Long) {
         if (BUSY_TONE_SECONDS <= 0) return
 
         Log.d(TAG, "Playing busy tone")
 
         // Ensure dialling pipelines exist
-        if (audioOutput == null || receiveMixer == null || dialTone == null) {
-            resetDiallingPipelines()
-        }
+        val prepared =
+            withCurrentGeneration(generation) {
+                if (audioOutput == null || receiveMixer == null || dialTone == null) {
+                    resetDiallingPipelines()
+                }
+            }
+        if (!prepared) return
 
         val windowMs = 500L
         val started = System.currentTimeMillis()
@@ -1177,11 +1333,15 @@ class Telephone(
 
         while (System.currentTimeMillis() - started < durationMs) {
             val elapsed = (System.currentTimeMillis() - started) % windowMs
-            if (elapsed > 250) {
-                enableDialTone()
-            } else {
-                muteDialTone()
-            }
+            val updated =
+                withCurrentGeneration(generation) {
+                    if (elapsed > 250) {
+                        enableDialTone()
+                    } else {
+                        muteDialTone()
+                    }
+                }
+            if (!updated) return
             delay(5)
         }
 
@@ -1327,10 +1487,10 @@ class Telephone(
     /**
      * Handle packetizer failure (link broken).
      */
-    private fun onPacketizerFailure() {
+    private fun onPacketizerFailure(generation: Long) {
         Log.e(TAG, "Packetizer failure, terminating call")
         scope.launch {
-            hangup()
+            hangupIfCurrent(generation)
         }
     }
 
