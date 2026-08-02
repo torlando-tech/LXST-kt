@@ -13,8 +13,10 @@ import io.mockk.slot
 import io.mockk.unmockkAll
 import io.mockk.verify
 import io.mockk.verifyOrder
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -482,6 +484,85 @@ class TelephoneTest {
     fun `STATUS_AVAILABLE signal updates call status`() {
         signalCallback?.invoke(Signalling.STATUS_AVAILABLE)
         assertEquals(Signalling.STATUS_AVAILABLE, telephone.callStatus)
+    }
+
+    @Test
+    fun `stale available teardown cannot end a newer call`() {
+        val deterministicTelephone =
+            Telephone(
+                context = mockContext,
+                networkTransport = mockTransport,
+                audioBridge = mockAudioBridge,
+                networkPacketBridge = mockPacketRouter,
+                callBridge = mockCallCoordinator,
+                ringTime = Long.MAX_VALUE,
+                waitTime = Telephone.WAIT_TIME_MS,
+                useNativePlayback = true,
+                useNativeCodec = false,
+                coroutineDispatcher = testDispatcher,
+                testOnly = Unit,
+            )
+        deterministicTelephone.onIncomingCall("attempt-a")
+        signalCallback?.invoke(Signalling.STATUS_AVAILABLE)
+
+        deterministicTelephone.hangup()
+        deterministicTelephone.onIncomingCall("attempt-b")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(Signalling.STATUS_RINGING, deterministicTelephone.callStatus)
+        verify(exactly = 1) { mockCallCoordinator.onCallEnded("attempt-a") }
+        verify(exactly = 0) { mockCallCoordinator.onCallEnded("attempt-b") }
+        deterministicTelephone.shutdown()
+    }
+
+    @Test
+    fun `delayed link failure cannot end a newer call`() =
+        runTest {
+            val establishmentStarted = CompletableDeferred<Unit>()
+            val establishmentResult = CompletableDeferred<Boolean>()
+            coEvery { mockTransport.establishLink(any()) } coAnswers {
+                establishmentStarted.complete(Unit)
+                establishmentResult.await()
+            }
+            val destination = ByteArray(16) { 0x01 }
+
+            val outgoing = launch { telephone.call(destination) }
+            establishmentStarted.await()
+            telephone.hangup()
+            telephone.onIncomingCall("attempt-b")
+            establishmentResult.complete(false)
+            outgoing.join()
+
+            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+            verify(exactly = 0) { mockCallCoordinator.onCallEnded("attempt-b") }
+        }
+
+    @Test
+    fun `stale available teardown cannot end fallback incoming call`() {
+        val deterministicTelephone =
+            Telephone(
+                context = mockContext,
+                networkTransport = mockTransport,
+                audioBridge = mockAudioBridge,
+                networkPacketBridge = mockPacketRouter,
+                callBridge = mockCallCoordinator,
+                ringTime = Long.MAX_VALUE,
+                waitTime = Telephone.WAIT_TIME_MS,
+                useNativePlayback = true,
+                useNativeCodec = false,
+                coroutineDispatcher = testDispatcher,
+                testOnly = Unit,
+            )
+        deterministicTelephone.onIncomingCall("attempt-a")
+        signalCallback?.invoke(Signalling.STATUS_AVAILABLE)
+
+        deterministicTelephone.hangup()
+        deterministicTelephone.prepareForAnswer("attempt-b")
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(Signalling.STATUS_RINGING, deterministicTelephone.callStatus)
+        verify(exactly = 0) { mockCallCoordinator.onCallEnded("attempt-b") }
+        deterministicTelephone.shutdown()
     }
 
     @Test
