@@ -29,7 +29,10 @@ interface NetworkTransport {
      * @param destinationHash 16-byte Reticulum destination hash
      * @return true if link established successfully, false otherwise
      */
-    suspend fun establishLink(destinationHash: ByteArray): Boolean
+    suspend fun establishLink(
+        destinationHash: ByteArray,
+        callSessionId: Long = 0L,
+    ): Boolean
 
     /**
      * Tear down the active link.
@@ -74,9 +77,9 @@ interface NetworkTransport {
      *
      * Callback is invoked on IO thread - implementations should not block.
      *
-     * @param callback Function receiving signalling codes
+     * @param callback Function receiving the originating call session ID and signalling code
      */
-    fun setSignalCallback(callback: (Int) -> Unit)
+    fun setSignalCallback(callback: (Long, Int) -> Unit)
 
     /**
      * Check if link is currently active.
