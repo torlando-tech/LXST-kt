@@ -170,6 +170,10 @@ class Telephone private constructor(
     @Volatile
     private var remoteIdentityHash: String? = null
 
+    /** Transport session attached to every inbound signal for the current call. */
+    @Volatile
+    private var activeCallSessionId: Long? = null
+
     // ===== Audio Pipeline Components (null when no call) =====
 
     private var receiveMixer: Mixer? = null
@@ -212,12 +216,13 @@ class Telephone private constructor(
     private var dialToneJob: Job? = null
     private var timeoutJob: Job? = null
     private val callGeneration = AtomicLong(0)
+    private val callSessionIds = AtomicLong(0)
     private val callStateLock = Any()
 
     init {
         // Wire up signal callback to handle incoming signals
-        networkTransport.setSignalCallback { signal ->
-            onSignalReceived(signal)
+        networkTransport.setSignalCallback { callSessionId, signal ->
+            onSignalReceived(callSessionId, signal)
         }
     }
 
@@ -236,7 +241,7 @@ class Telephone private constructor(
         profile: Profile = Profile.DEFAULT,
     ) {
         val destinationIdentity = destinationHash.toHexString()
-        val generation =
+        val admission =
             synchronized(callStateLock) {
                 if (isCallActive()) {
                     null
@@ -246,6 +251,8 @@ class Telephone private constructor(
                     isIncomingCall = false
                     remoteIdentityHash = destinationIdentity
                     val acceptedGeneration = callGeneration.incrementAndGet()
+                    val acceptedSessionId = allocateCallSessionId()
+                    activeCallSessionId = acceptedSessionId
 
                     callBridge.setConnecting(destinationIdentity)
                     timeoutJob?.cancel()
@@ -256,20 +263,21 @@ class Telephone private constructor(
                                 callStatus < Signalling.STATUS_ESTABLISHED
                             }
                         }
-                    acceptedGeneration
+                    acceptedGeneration to acceptedSessionId
                 }
             }
-        if (generation == null) {
+        if (admission == null) {
             Log.w(TAG, "Already in call, ignoring")
             return
         }
+        val (generation, callSessionId) = admission
 
         Log.i(TAG, "Initiating call to ${destinationIdentity.take(16)}...")
 
         // Establish link via NetworkTransport
         val linkEstablished =
             withTimeoutOrNull(waitTime) {
-                networkTransport.establishLink(destinationHash)
+                networkTransport.establishLink(destinationHash, callSessionId)
             }
 
         if (linkEstablished != true) {
@@ -406,6 +414,7 @@ class Telephone private constructor(
         receiveMuted = false
         isIncomingCall = false
         remoteIdentityHash = null
+        activeCallSessionId = null
 
         // Notify UI based on reason
         when (reason) {
@@ -526,6 +535,9 @@ class Telephone private constructor(
      */
     fun isCallActive(): Boolean = callStatus != Signalling.STATUS_AVAILABLE
 
+    /** Allocate an opaque ID that the transport must attach to callbacks from one link. */
+    fun allocateCallSessionId(): Long = callSessionIds.incrementAndGet()
+
     // ===== Ringtone Configuration =====
 
     /**
@@ -565,8 +577,15 @@ class Telephone private constructor(
      * ahead of openPipelines(), leaving pipeline components created but never
      * started — no audio flows.
      */
-    private fun onSignalReceived(signal: Int) {
+    private fun onSignalReceived(
+        callSessionId: Long,
+        signal: Int,
+    ) {
         synchronized(callStateLock) {
+            if (activeCallSessionId != callSessionId) {
+                Log.d(TAG, "Ignoring signal from stale call session $callSessionId")
+                return
+            }
             onSignalReceivedLocked(signal)
         }
     }
@@ -675,7 +694,10 @@ class Telephone private constructor(
      *
      * @param identityHash Hex string of caller's identity hash
      */
-    fun onIncomingCall(identityHash: String) {
+    fun onIncomingCall(
+        identityHash: String,
+        callSessionId: Long = allocateCallSessionId(),
+    ) {
         Log.i(TAG, "Incoming call from ${identityHash.take(16)}...")
 
         val generation =
@@ -687,6 +709,7 @@ class Telephone private constructor(
                     remoteIdentityHash = identityHash
                     callStatus = Signalling.STATUS_RINGING
                     val acceptedGeneration = callGeneration.incrementAndGet()
+                    activeCallSessionId = callSessionId
 
                     prepareDiallingPipelines()
                     activateRingTone(acceptedGeneration)
@@ -720,7 +743,10 @@ class Telephone private constructor(
      * this does NOT activate ringtone, notify CallCoordinator, or start the ring
      * timeout — those have already happened through Python's direct CallCoordinator call.
      */
-    fun prepareForAnswer(identityHash: String) {
+    fun prepareForAnswer(
+        identityHash: String,
+        callSessionId: Long = allocateCallSessionId(),
+    ) {
         val accepted =
             synchronized(callStateLock) {
                 if (isCallActive()) {
@@ -730,6 +756,7 @@ class Telephone private constructor(
                     remoteIdentityHash = identityHash
                     callStatus = Signalling.STATUS_RINGING
                     callGeneration.incrementAndGet()
+                    activeCallSessionId = callSessionId
                     true
                 }
             }

@@ -55,7 +55,29 @@ class TelephoneTest {
     private lateinit var mockCallCoordinator: CallCoordinator
     private lateinit var telephone: Telephone
 
-    private var signalCallback: ((Int) -> Unit)? = null
+    private class SignalEmitter {
+        var callback: ((Long, Int) -> Unit)? = null
+
+        operator fun invoke(signal: Int) {
+            callback?.invoke(1L, signal)
+        }
+
+        operator fun invoke(
+            callSessionId: Long,
+            signal: Int,
+        ) {
+            callback?.invoke(callSessionId, signal)
+        }
+    }
+
+    private var signalCallback: SignalEmitter? = SignalEmitter()
+
+    private fun emitSignal(
+        signal: Int,
+        callSessionId: Long = 1L,
+    ) {
+        signalCallback?.invoke(callSessionId, signal)
+    }
 
     @Before
     fun setup() {
@@ -68,9 +90,9 @@ class TelephoneTest {
         mockCallCoordinator = mockk(relaxed = true)
 
         // Capture signal callback when registered
-        val signalSlot = slot<(Int) -> Unit>()
+        val signalSlot = slot<(Long, Int) -> Unit>()
         every { mockTransport.setSignalCallback(capture(signalSlot)) } answers {
-            signalCallback = signalSlot.captured
+            signalCallback?.callback = signalSlot.captured
         }
 
         every { mockTransport.isLinkActive } returns false
@@ -262,11 +284,11 @@ class TelephoneTest {
             val destHash = ByteArray(32) { 0x00 }
 
             // Mock link establishment to fail (so we don't go further into call setup)
-            coEvery { mockTransport.establishLink(any()) } returns false
+            coEvery { mockTransport.establishLink(any(), any()) } returns false
 
             telephone.call(destHash)
 
-            coVerify { mockTransport.establishLink(destHash) }
+            coVerify { mockTransport.establishLink(destHash, any()) }
         }
 
     @Test
@@ -274,7 +296,7 @@ class TelephoneTest {
         runTest {
             val destHash = ByteArray(32) { 0x00 }
 
-            coEvery { mockTransport.establishLink(any()) } coAnswers {
+            coEvery { mockTransport.establishLink(any(), any()) } coAnswers {
                 // Profile should be set during call setup
                 assertEquals(Profile.HQ, telephone.activeProfile)
                 true
@@ -292,7 +314,7 @@ class TelephoneTest {
         runTest {
             val destHash = ByteArray(32) { 0x00 }
 
-            coEvery { mockTransport.establishLink(any()) } coAnswers {
+            coEvery { mockTransport.establishLink(any(), any()) } coAnswers {
                 // Check status during link establishment
                 assertEquals(Signalling.STATUS_CALLING, telephone.callStatus)
                 false
@@ -306,7 +328,7 @@ class TelephoneTest {
         runTest {
             val destHash = ByteArray(32) { 0x00 }
 
-            coEvery { mockTransport.establishLink(any()) } returns false
+            coEvery { mockTransport.establishLink(any(), any()) } returns false
 
             telephone.call(destHash)
 
@@ -325,7 +347,7 @@ class TelephoneTest {
     fun `hangup resets call status to AVAILABLE`() =
         runTest {
             // Start a call first
-            coEvery { mockTransport.establishLink(any()) } returns false
+            coEvery { mockTransport.establishLink(any(), any()) } returns false
             telephone.call(ByteArray(32))
             advanceUntilIdle()
 
@@ -355,7 +377,7 @@ class TelephoneTest {
     fun `hangup resets activeProfile to DEFAULT`() =
         runTest {
             // Start a call with non-default profile (link succeeds so call stays active)
-            coEvery { mockTransport.establishLink(any()) } returns true
+            coEvery { mockTransport.establishLink(any(), any()) } returns true
             telephone.call(ByteArray(32), Profile.SHQ)
             advanceUntilIdle()
             assertEquals(Profile.SHQ, telephone.activeProfile)
@@ -482,7 +504,9 @@ class TelephoneTest {
 
     @Test
     fun `STATUS_AVAILABLE signal updates call status`() {
-        signalCallback?.invoke(Signalling.STATUS_AVAILABLE)
+        telephone.onIncomingCall("attempt-a", 1L)
+        emitSignal(Signalling.STATUS_AVAILABLE)
+        verify(timeout = 1_000) { mockCallCoordinator.onCallEnded("attempt-a") }
         assertEquals(Signalling.STATUS_AVAILABLE, telephone.callStatus)
     }
 
@@ -516,11 +540,53 @@ class TelephoneTest {
     }
 
     @Test
+    fun `signal delivered from old transport session cannot mutate newer call`() {
+        telephone.onIncomingCall("attempt-a", 101L)
+        telephone.hangup()
+        telephone.onIncomingCall("attempt-b", 202L)
+
+        signalCallback?.invoke(101L, Signalling.STATUS_AVAILABLE)
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+        verify(exactly = 0) { mockCallCoordinator.onCallEnded("attempt-b") }
+    }
+
+    @Test
+    fun `default incoming session cannot collide with following outgoing call`() =
+        runTest {
+            telephone.onIncomingCall("attempt-a")
+            telephone.hangup()
+            coEvery { mockTransport.establishLink(any(), any()) } returns true
+
+            telephone.call(ByteArray(16) { 0x02 })
+            signalCallback?.invoke(1L, Signalling.STATUS_AVAILABLE)
+            testDispatcher.scheduler.runCurrent()
+
+            assertEquals(Signalling.STATUS_CALLING, telephone.callStatus)
+        }
+
+    @Test
+    fun `outgoing session cannot collide with following default incoming call`() =
+        runTest {
+            coEvery { mockTransport.establishLink(any(), any()) } returns true
+            telephone.call(ByteArray(16) { 0x03 })
+            telephone.hangup()
+            telephone.onIncomingCall("attempt-b")
+
+            signalCallback?.invoke(1L, Signalling.STATUS_AVAILABLE)
+            testDispatcher.scheduler.runCurrent()
+
+            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+            verify(exactly = 0) { mockCallCoordinator.onCallEnded("attempt-b") }
+        }
+
+    @Test
     fun `delayed link failure cannot end a newer call`() =
         runTest {
             val establishmentStarted = CompletableDeferred<Unit>()
             val establishmentResult = CompletableDeferred<Boolean>()
-            coEvery { mockTransport.establishLink(any()) } coAnswers {
+            coEvery { mockTransport.establishLink(any(), any()) } coAnswers {
                 establishmentStarted.complete(Unit)
                 establishmentResult.await()
             }
@@ -568,6 +634,7 @@ class TelephoneTest {
     @Test
     fun `STATUS_RINGING signal updates call status`() =
         runTest {
+            telephone.onIncomingCall("attempt-a", 1L)
             signalCallback?.invoke(Signalling.STATUS_RINGING)
             advanceUntilIdle()
             assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
@@ -578,6 +645,7 @@ class TelephoneTest {
         // STATUS_CONNECTING triggers openPipelines() which requires JNI
         // Catch UnsatisfiedLinkError since codec creation can't run in unit tests
         try {
+            telephone.onIncomingCall("attempt-a", 1L)
             signalCallback?.invoke(Signalling.STATUS_CONNECTING)
             assertEquals(Signalling.STATUS_CONNECTING, telephone.callStatus)
         } catch (e: UnsatisfiedLinkError) {
@@ -694,7 +762,7 @@ class TelephoneTest {
     @Test
     fun `isCallActive returns true when status is CALLING`() =
         runTest {
-            coEvery { mockTransport.establishLink(any()) } coAnswers {
+            coEvery { mockTransport.establishLink(any(), any()) } coAnswers {
                 // During link establishment, status should be CALLING
                 assertTrue(telephone.isCallActive())
                 false
