@@ -458,18 +458,16 @@ class TelephoneTest {
         }
 
     @Test
-    fun `prepareForAnswer accepts only originating transport session signals`() =
-        runTest {
-            telephone.prepareForAnswer("abcd1234", 2L)
+    fun `prepareForAnswer accepts only originating transport session signals`() {
+        telephone.prepareForAnswer("abcd1234", 2L)
+        val profileSignal = Signalling.PREFERRED_PROFILE + Profile.HQ.id
 
-            emitSignal(Signalling.STATUS_AVAILABLE, callSessionId = 1L)
-            advanceUntilIdle()
-            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+        emitSignal(profileSignal, callSessionId = 1L)
+        assertEquals(Profile.DEFAULT, telephone.activeProfile)
 
-            emitSignal(Signalling.STATUS_AVAILABLE, callSessionId = 2L)
-            advanceUntilIdle()
-            assertEquals(Signalling.STATUS_AVAILABLE, telephone.callStatus)
-        }
+        emitSignal(profileSignal, callSessionId = 2L)
+        assertEquals(Profile.HQ, telephone.activeProfile)
+    }
 
     // ===== Incoming Call =====
 
