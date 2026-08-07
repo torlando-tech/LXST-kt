@@ -742,10 +742,12 @@ class Telephone private constructor(
      * (_notify_kotlin) fails to reach onIncomingCall(). Unlike onIncomingCall(),
      * this does NOT activate ringtone, notify CallCoordinator, or start the ring
      * timeout — those have already happened through Python's direct CallCoordinator call.
+     * The caller must pass the originating transport session ID; inventing one here
+     * would cause valid transport callbacks to be rejected as stale.
      */
     fun prepareForAnswer(
         identityHash: String,
-        callSessionId: Long = allocateCallSessionId(),
+        callSessionId: Long,
     ) {
         val accepted =
             synchronized(callStateLock) {

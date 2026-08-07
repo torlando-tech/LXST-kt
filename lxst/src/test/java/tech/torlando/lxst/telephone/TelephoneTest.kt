@@ -432,7 +432,7 @@ class TelephoneTest {
 
     @Test
     fun `prepareForAnswer sets state for answering`() {
-        telephone.prepareForAnswer("abcd1234")
+        telephone.prepareForAnswer("abcd1234", 1L)
         // answer() should now succeed
         val result = telephone.answer()
         assertTrue(result)
@@ -441,7 +441,7 @@ class TelephoneTest {
 
     @Test
     fun `prepareForAnswer does not activate ringtone or notify bridge`() {
-        telephone.prepareForAnswer("abcd1234")
+        telephone.prepareForAnswer("abcd1234", 1L)
         // Should NOT trigger callBridge.onIncomingCall (that already happened via Python)
         verify(exactly = 0) { mockCallCoordinator.onIncomingCall(any()) }
     }
@@ -452,9 +452,23 @@ class TelephoneTest {
             telephone.onIncomingCall("first1234")
             advanceUntilIdle()
 
-            telephone.prepareForAnswer("second5678")
+            telephone.prepareForAnswer("second5678", 2L)
             // Should still be on first call
             assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+        }
+
+    @Test
+    fun `prepareForAnswer accepts only originating transport session signals`() =
+        runTest {
+            telephone.prepareForAnswer("abcd1234", 2L)
+
+            emitSignal(Signalling.STATUS_AVAILABLE, callSessionId = 1L)
+            advanceUntilIdle()
+            assertEquals(Signalling.STATUS_RINGING, telephone.callStatus)
+
+            emitSignal(Signalling.STATUS_AVAILABLE, callSessionId = 2L)
+            advanceUntilIdle()
+            assertEquals(Signalling.STATUS_AVAILABLE, telephone.callStatus)
         }
 
     // ===== Incoming Call =====
@@ -623,7 +637,7 @@ class TelephoneTest {
         signalCallback?.invoke(Signalling.STATUS_AVAILABLE)
 
         deterministicTelephone.hangup()
-        deterministicTelephone.prepareForAnswer("attempt-b")
+        deterministicTelephone.prepareForAnswer("attempt-b", 2L)
         testDispatcher.scheduler.runCurrent()
 
         assertEquals(Signalling.STATUS_RINGING, deterministicTelephone.callStatus)
