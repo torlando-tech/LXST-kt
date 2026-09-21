@@ -6,6 +6,7 @@
 #define LXST_NATIVE_AUDIO_FILTERS_H
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 
 /**
@@ -46,6 +47,18 @@ public:
      */
     void process(int16_t* samples, int numSamples, int sampleRate);
 
+    /**
+     * Pause or resume the AGC stage.
+     *
+     * When paused, AGC is bypassed (frames pass through HPF/LPF unmodified by
+     * gain). Matches Python LXST Filters.AGC.paused and the Kotlin
+     * AudioFilters.VoiceFilterChain agc.paused. Set true while half-duplex
+     * transmit is squelched so gain state does not drift on silence.
+     */
+    void setAgcPaused(bool paused);
+
+    bool isAgcPaused() const { return agcPaused_; }
+
 private:
     // --- High-pass filter (first-order RC) ---
     struct HighPassState {
@@ -85,6 +98,9 @@ private:
     HighPassState hp_;
     LowPassState lp_;
     AGCState agc_;
+
+    // Atomic: read in the capture callback thread (SCHED_FIFO), set from Java.
+    std::atomic<bool> agcPaused_{false};
 
     std::unique_ptr<float[]> workBuffer_;
     int workBufferSize_ = 0;

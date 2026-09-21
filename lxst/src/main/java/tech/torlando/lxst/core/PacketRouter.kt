@@ -13,6 +13,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 // TODO: Future reorganization (Option B) — redistribute core/ classes by domain:
 //   CallCoordinator, CallState → telephone/
@@ -70,6 +71,13 @@ class PacketRouter private constructor(
 
     // Dedicated IO scope for non-blocking transport calls
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Half-duplex transmit squelch. When true, sendPacket() drops audio frames
+    // so nothing is transmitted on the wire (matches Python LXST Packetizer.squelch -
+    // the frame is dropped before encoding/sending, not sent as silence).
+    // Signalling (sendSignal) is intentionally NOT squelched: mode/profile
+    // negotiation and call status must flow even while transmit is gated.
+    private val squelched = AtomicBoolean(false)
 
     // Audio packet channel — serializes outbound calls to prevent
     // concurrent transport access from multiple IO threads.
@@ -133,8 +141,36 @@ class PacketRouter private constructor(
      * @param encodedFrame Encoded audio data (Opus/Codec2/Null bytes with codec header)
      */
     fun sendPacket(encodedFrame: ByteArray) {
+        if (squelched.get()) return
         packetChannel.trySend(encodedFrame)
     }
+
+    /**
+     * Squelch (gate) outbound audio transmission.
+     *
+     * While squelched, [sendPacket] drops frames so nothing is transmitted on the
+     * wire - this is the half-duplex PTT "not talking" state. Matches Python LXST
+     * `Packetizer.squelch()` (frame dropped, no TX). Signalling is unaffected.
+     *
+     * **CRITICAL:** No Log.d() - may be called from the audio thread.
+     */
+    fun squelch() {
+        squelched.set(true)
+    }
+
+    /**
+     * Resume outbound audio transmission (clear the half-duplex squelch).
+     *
+     * **CRITICAL:** No Log.d() - may be called from the audio thread.
+     */
+    fun unsquelch() {
+        squelched.set(false)
+    }
+
+    /**
+     * @return true while outbound audio is squelched (half-duplex not transmitting).
+     */
+    fun isSquelched(): Boolean = squelched.get()
 
     /**
      * Send signalling to the network transport.
@@ -262,6 +298,7 @@ class PacketRouter private constructor(
      */
     fun shutdown() {
         Log.i(TAG, "Shutting down network bridge")
+        squelched.set(false)
         packetChannel.close()
         scope.cancel()
         packetHandler = null

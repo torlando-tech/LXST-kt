@@ -102,6 +102,36 @@ class Telephone(
     var activeProfile: Profile = Profile.DEFAULT
         private set
 
+    /** Active call duplex mode. */
+    @Volatile
+    var activeMode: Mode = Mode.DEFAULT
+        private set
+
+    // Half-duplex transmit gating state (Python Telephony.py).
+    //
+    // A single condition governs BOTH the wire squelch and AGC pause, matching the
+    // Python LXST steady states:
+    //   gated = modeHalfDuplex AND NOT pttHeld
+    //
+    // Python splits this into two primitives that combine to the same result:
+    //  - __select_call_mode (switch_mode): squelches the packetizer on HDX,
+    //    unsquelches on FDX.
+    //  - squelch_transmit / unsquelch_transmit (PTT): pause/resume AGC AND
+    //    squelch/unsquelch the packetizer.
+    //
+    // Steady states: FDX = unsquelched + AGC running; HDX not talking = squelched +
+    // AGC paused; HDX talking (PTT held) = unsquelched + AGC running. This is exactly
+    // `gated = (HDX && !pttHeld)` for both the squelch and the AGC pause.
+    //
+    // FDX never gates regardless of PTT (Python: PTT only affects half-duplex transmit;
+    // the UI hides the PTT button in full duplex).
+    @Volatile
+    private var modeHalfDuplex = false
+
+    // True while the PTT button is held (transmitting) in half-duplex.
+    @Volatile
+    private var pttHeld = false
+
     /** Transmit mute state (persists across profile switches - CONTEXT.md) */
     @Volatile
     private var transmitMuted = false
@@ -323,6 +353,12 @@ class Telephone(
         val previousIdentity = remoteIdentityHash
         callStatus = Signalling.STATUS_AVAILABLE
         activeProfile = Profile.DEFAULT
+        // Reset call mode and transmit gate (mode is per-call in Python).
+        activeMode = Mode.DEFAULT
+        modeHalfDuplex = false
+        pttHeld = false
+        networkPacketBridge.unsquelch()
+        setAgcPaused(false)
         transmitMuted = false
         receiveMuted = false
         isIncomingCall = false
@@ -365,6 +401,117 @@ class Telephone(
 
         // Reconfigure transmit pipeline with new codec
         reconfigureTransmitPipeline()
+    }
+
+    // ===== Call mode (full/half duplex) negotiation =====
+    // Matches Python Telephony.py switch_mode / __select_call_mode / signalling.
+
+    /**
+     * Switch call duplex mode during an active call (local-initiated).
+     *
+     * Matches Python Telephony.py switch_mode() (lines 597-606). When the call is
+     * established, updates [activeMode], signals [Signalling.PREFERRED_MODE] to the
+     * peer, and applies the transmit gate (HDX squelches the wire; FDX unsquelches).
+     *
+     * No-op if the call is not established or the mode is unchanged. The codec
+     * profile is unaffected by mode.
+     *
+     * @param mode New duplex mode (FULL_DUPLEX or HALF_DUPLEX)
+     */
+    fun switchMode(mode: Mode) {
+        if (activeMode == mode) {
+            Log.d(TAG, "Already in mode ${mode.abbreviation}, ignoring")
+            return
+        }
+        if (callStatus != Signalling.STATUS_ESTABLISHED) {
+            Log.w(TAG, "Cannot switch mode: call not established (status=$callStatus)")
+            return
+        }
+        Log.i(TAG, "Switching mode from ${activeMode.abbreviation} to ${mode.abbreviation}")
+        activeMode = mode
+        modeHalfDuplex = mode == Mode.HALF_DUPLEX
+        // Signal mode change to remote (PREFERRED_MODE + mode byte).
+        networkTransport.sendSignal(Signalling.PREFERRED_MODE + mode.id)
+        applyTransmitGate()
+    }
+
+    /**
+     * Handle a call-mode change received from the remote peer.
+     *
+     * Matches Python signalling_received (line 909-912) -> switch_mode(from_signalling).
+     * Updates [activeMode] and applies the transmit gate without signalling back.
+     */
+    private fun switchModeFromRemote(mode: Mode) {
+        Log.i(TAG, "Remote requested mode switch to ${mode.abbreviation}")
+        if (activeMode == mode) return
+        activeMode = mode
+        modeHalfDuplex = mode == Mode.HALF_DUPLEX
+        applyTransmitGate()
+    }
+
+    /**
+     * Select call mode for call setup (before established) without signalling.
+     *
+     * Matches Python `else: __select_call_mode(mode)` in signalling_received - a mode
+     * preference received during IDENT/CONNECTING is applied locally for call setup.
+     */
+    private fun selectCallMode(mode: Mode) {
+        Log.d(TAG, "Selecting call mode: ${mode.abbreviation}")
+        activeMode = mode
+        modeHalfDuplex = mode == Mode.HALF_DUPLEX
+    }
+
+    /**
+     * Set the PTT (push-to-talk) transmit state in half-duplex.
+     *
+     * Matches Python squelch_transmit / unsquelch_transmit (lines 571-581). Holding
+     * PTT (active=true) unsquelches transmit and resumes AGC so the user is heard;
+     * releasing (active=false) squelches transmit and pauses AGC. In full duplex this
+     * is a no-op (matches Python: PTT only gates half-duplex transmit).
+     *
+     * @param active True while the PTT button is held (transmitting).
+     */
+    fun setPttActive(active: Boolean) {
+        Log.d(TAG, "PTT active: $active (mode=${activeMode.abbreviation})")
+        pttHeld = active
+        applyTransmitGate()
+    }
+
+    /**
+     * @return true when transmit is gated (HDX and PTT not held). This single
+     *   condition drives both the wire squelch and the AGC pause.
+     */
+    private fun gated(): Boolean = modeHalfDuplex && !pttHeld
+
+    /**
+     * Apply the half-duplex transmit gate to the network packet bridge and AGC.
+     *
+     * When [gated] is true (half-duplex, PTT not held) the wire is squelched (no TX)
+     * and AGC is paused. Otherwise the wire is open and AGC runs. This unifies the
+     * Python mode-squelch (__select_call_mode) and PTT-squelch (squelch_transmit)
+     * paths into one consistent steady state.
+     *
+     * Called on the audio/signalling threads; squelch()/setAgcPaused() must be fast
+     * and lock-free.
+     */
+    private fun applyTransmitGate() {
+        val gated = gated()
+        if (gated) {
+            networkPacketBridge.squelch()
+        } else {
+            networkPacketBridge.unsquelch()
+        }
+        setAgcPaused(gated)
+    }
+
+    /**
+     * Pause or resume AGC on the capture path (Kotlin filter chain and native engine).
+     */
+    private fun setAgcPaused(paused: Boolean) {
+        audioBridge.setAgcPaused(paused)
+        if (useNativeCodec && useNativePlayback) {
+            NativeCaptureEngine.setAgcPaused(paused)
+        }
     }
 
     /**
@@ -534,6 +681,24 @@ class Telephone(
                     startPipelines()
                     callStatus = signal
                     remoteIdentityHash?.let { callBridge.onCallEstablished(it) }
+                }
+            }
+
+            signal in Signalling.PREFERRED_MODE until Signalling.PREFERRED_PROFILE -> {
+                // Call-mode change from remote (Python signalling_received line 909).
+                // Mode signals occupy 0xF0-0xFE, just below the profile base (0xFF).
+                // Without this branch they were silently dropped.
+                val modeId = signal - Signalling.PREFERRED_MODE
+                Log.d(TAG, "Mode change signal: 0x${modeId.toString(16)}")
+
+                Mode.fromId(modeId)?.let { mode ->
+                    if (callStatus == Signalling.STATUS_ESTABLISHED) {
+                        // Mid-call mode switch
+                        switchModeFromRemote(mode)
+                    } else {
+                        // Pre-established: select mode for call setup
+                        selectCallMode(mode)
+                    }
                 }
             }
 
@@ -864,6 +1029,12 @@ class Telephone(
         audioInput?.start()
         linkSource?.start()
         packetizer?.start()
+
+        // Re-apply the half-duplex transmit gate now that the packetizer is running.
+        // Matches Python __select_call_mode(self.active_call.call_mode) on pipeline
+        // open (Telephony.py line 673) - a mode selected pre-established takes effect
+        // once the TX pipeline exists.
+        applyTransmitGate()
 
         Log.i(TAG, "Audio pipelines started")
     }

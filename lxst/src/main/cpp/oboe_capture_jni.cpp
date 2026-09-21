@@ -176,6 +176,17 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeSetCaptureMute(
 }
 
 JNIEXPORT void JNICALL
+Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeSetAgcPaused(
+        JNIEnv* /*env*/,
+        jobject /*thiz*/,
+        jboolean paused) {
+
+    if (sCaptureEngine) {
+        sCaptureEngine->setAgcPaused(paused);
+    }
+}
+
+JNIEXPORT void JNICALL
 Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeDestroyEncoder(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {

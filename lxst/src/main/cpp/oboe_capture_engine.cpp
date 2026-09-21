@@ -279,6 +279,12 @@ void OboeCaptureEngine::setCaptureMute(bool mute) {
     captureMuted_.store(mute, std::memory_order_relaxed);
 }
 
+void OboeCaptureEngine::setAgcPaused(bool paused) {
+    if (filterChain_) {
+        filterChain_->setAgcPaused(paused);
+    }
+}
+
 void OboeCaptureEngine::destroyEncoder() {
     encodeInCallback_ = false;
     encoder_.reset();

@@ -33,6 +33,15 @@ object Signalling {
     // e.g., 0xFF + 0x40 = profile MQ (QUALITY_MEDIUM)
     /** Base for profile change signals. Signal = PREFERRED_PROFILE + profile_byte. */
     const val PREFERRED_PROFILE = 0xFF
+
+    // Call-mode change prefix
+    // Actual signal = PREFERRED_MODE + mode_byte
+    // e.g., 0xF0 + 0x02 = HALF_DUPLEX. Matches Python Telephony.py
+    // Signalling.PREFERRED_MODE = 0xF0. Must be checked BEFORE PREFERRED_PROFILE
+    // because mode IDs (0x01/0x02) are below the profile base and would otherwise
+    // be misparsed as status.
+    /** Base for call-mode change signals. Signal = PREFERRED_MODE + mode_byte. */
+    const val PREFERRED_MODE = 0xF0
 }
 
 /**
@@ -52,6 +61,10 @@ object Signalling {
  *        - signal: Raw signal value received
  *        - isProfileChange: True if signal >= PREFERRED_PROFILE
  *        - profile: Profile byte if isProfileChange, null otherwise
+ *
+ * Note: call-mode signals (PREFERRED_MODE..PREFERRED_PROFILE-1) are routed by
+ * [Telephone.onSignalReceived] in the live path, which is where mode negotiation is
+ * handled. This helper's callback does not separately carry a mode value.
  */
 class SignallingReceiver(
     private val bridge: PacketRouter,
@@ -98,6 +111,18 @@ class SignallingReceiver(
      */
     fun signalProfileChange(profile: Int) {
         signal(Signalling.PREFERRED_PROFILE + profile)
+    }
+
+    /**
+     * Send call-mode change signal.
+     *
+     * Convenience method that adds the PREFERRED_MODE prefix. Mode values from
+     * Python Telephony.py Profiles: 0x01 FULL_DUPLEX, 0x02 HALF_DUPLEX.
+     *
+     * @param mode Mode byte (e.g., 0x02 for HALF_DUPLEX)
+     */
+    fun signalModeChange(mode: Int) {
+        signal(Signalling.PREFERRED_MODE + mode)
     }
 
     /**

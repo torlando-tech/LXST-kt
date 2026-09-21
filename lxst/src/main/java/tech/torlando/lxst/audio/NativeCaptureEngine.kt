@@ -132,6 +132,18 @@ object NativeCaptureEngine {
         nativeSetCaptureMute(mute)
     }
 
+    /**
+     * Pause or resume the native AGC stage.
+     *
+     * When paused, AGC is bypassed so gain state does not drift while half-duplex
+     * transmit is squelched (PTT not held). Matches Python LXST AGC.paused.
+     * No-op if the filter chain is disabled.
+     */
+    fun setAgcPaused(paused: Boolean) {
+        ensureLoaded()
+        nativeSetAgcPaused(paused)
+    }
+
     /** Destroy the native encoder, freeing codec resources. */
     fun destroyEncoder() {
         ensureLoaded()
@@ -176,6 +188,8 @@ object NativeCaptureEngine {
     private external fun nativeReadEncodedPacket(dest: ByteArray): Int
 
     private external fun nativeSetCaptureMute(mute: Boolean)
+
+    private external fun nativeSetAgcPaused(paused: Boolean)
 
     private external fun nativeDestroyEncoder()
 }

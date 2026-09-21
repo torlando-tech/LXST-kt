@@ -696,6 +696,22 @@ class AudioDevice(
     // ===== Voice Call Audio Mode (for Oboe path) =====
 
     /**
+     * Pause or resume the Kotlin AGC stage (Phase 2 capture filter chain).
+     *
+     * When paused, AGC is bypassed so gain state does not drift while half-duplex
+     * transmit is squelched (PTT not held). Matches Python LXST AGC.paused. No-op
+     * when the filter chain is disabled (filtersEnabled = false).
+     *
+     * The native Oboe capture path (Phase 3) is paused separately via
+     * [tech.torlando.lxst.audio.NativeCaptureEngine.setAgcPaused].
+     *
+     * @param paused True to pause AGC, false to resume.
+     */
+    fun setAgcPaused(paused: Boolean) {
+        filterChain?.agc?.paused = paused
+    }
+
+    /**
      * Set audio mode to MODE_IN_COMMUNICATION and configure speaker/earpiece routing.
      *
      * Must be called when using native Oboe streams (Phase 2+) since OboeLineSink
