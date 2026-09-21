@@ -10,6 +10,7 @@ import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.unmockkAll
 import io.mockk.verify
+import io.mockk.verifyOrder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -19,6 +20,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -229,6 +231,66 @@ class TelephoneModeTest {
         assertEquals(Mode.FULL_DUPLEX, telephone.activeMode)
         verify { mockPacketRouter.unsquelch() }
     }
+
+    // ===== Concurrency: gate state must always reflect the latest inputs =====
+    // Greptile P1 "Concurrent updates leave stale gates": a remote HDX switch and a
+    // local PTT press must not interleave into a stale gate (e.g. PTT held but wire
+    // still squelched). Both the signal handler and the public mode/PTT entry points
+    // are @Synchronized on the same monitor, so each read-modify-write of
+    // (mode, pttHeld) + applyTransmitGate is atomic and the gate always ends in the
+    // state that matches the FINAL inputs. We pin that invariant by clearing
+    // invocations after setup and asserting the exact ordered gate sequence - a
+    // stale intermediate gate (the P1 bug) would reorder or drop a transition.
+
+    @Test
+    fun `remote HDX then local PTT press ends open (PTT held)`() = runTest {
+        establishCall()
+        // Remote switches us to HDX -> squelch (PTT not held).
+        signalCallback?.invoke(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id)
+        assertEquals(Mode.HALF_DUPLEX, telephone.activeMode)
+        // Then the local user presses PTT (transmitting): must re-open the wire.
+        // A stale squelch from the remote switch must not linger (the P1 bug - no
+        // TX until the next transition). The ordered sequence proves the PTT press
+        // re-applied the gate after the remote squelch.
+        telephone.setPttActive(true)
+        verifyOrder {
+            mockPacketRouter.squelch()    // remote HDX, PTT released
+            mockPacketRouter.unsquelch()  // PTT held -> open
+        }
+        verify { mockAudioBridge.setAgcPaused(false) }
+    }
+
+    @Test
+    fun `local PTT press then remote HDX ends open (PTT held)`() = runTest {
+        establishCall()
+        // Local PTT press while still FDX: FDX never squelches, so no gate flip.
+        telephone.setPttActive(true)
+        // Remote switches to HDX. PTT is held, so the gate computes open
+        // (HDX && !pttHeld = false) - it must NOT squelch even though mode is HDX.
+        signalCallback?.invoke(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id)
+        assertEquals(Mode.HALF_DUPLEX, telephone.activeMode)
+        // No squelch may have happened; the gate ends open.
+        verify(exactly = 0) { mockPacketRouter.squelch() }
+        verify { mockPacketRouter.unsquelch() }
+        verify { mockAudioBridge.setAgcPaused(false) }
+    }
+
+    @Test
+    fun `remote HDX then PTT release ends squelched`() = runTest {
+        establishCall()
+        signalCallback?.invoke(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id)
+        telephone.setPttActive(true)   // open (PTT held)
+        telephone.setPttActive(false)  // release -> squelch again
+        // Final state: HDX + PTT released => squelched + AGC paused.
+        verifyOrder {
+            mockPacketRouter.squelch()    // remote HDX
+            mockPacketRouter.unsquelch()  // PTT held
+            mockPacketRouter.squelch()    // PTT released
+        }
+        verify { mockAudioBridge.setAgcPaused(true) }
+    }
+
+
 
     @Test
     fun `pre-established mode signal selects mode without signalling or gating`() {

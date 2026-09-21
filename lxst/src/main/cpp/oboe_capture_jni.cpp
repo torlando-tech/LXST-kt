@@ -3,14 +3,31 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #include <jni.h>
+#include <mutex>
 #include <android/log.h>
 #include "oboe_capture_engine.h"
 
 #define LOG_TAG "LXST:OboeCaptureJNI"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Singleton engine — one capture stream at a time (matches Telephone lifecycle)
+// Singleton engine - one capture stream at a time (matches Telephone lifecycle).
+//
+// Lifetime is guarded by sCaptureEngineMutex: every JNI method that reads or
+// dereferences sCaptureEngine holds it. This is required because the engine is
+// torn down asynchronously on remote hangup (nativeDestroy deletes the object
+// and nulls the pointer) while a concurrent control-plane call - e.g. a PTT
+// release invoking nativeSetAgcPaused - may be checking the pointer and
+// dereferencing it in the same instant. Without the lock that is a
+// use-after-free (check `if (sCaptureEngine)` passes, then nativeDestroy
+// deletes it, then we dereference a dangling pointer). The atomic AGC-pause
+// flag only protects the flag's own value, not the engine object that owns it,
+// so the pointer itself needs its own lifetime synchronization.
+//
+// The Oboe audio thread (onAudioReady) operates directly on the engine object
+// that Oboe holds, never through sCaptureEngine, so it does not take this
+// mutex; there is no audio-thread deadlock.
 static OboeCaptureEngine* sCaptureEngine = nullptr;
+static std::mutex sCaptureEngineMutex;
 
 extern "C" {
 
@@ -23,6 +40,8 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeCreate(
         jint frameSamples,
         jint maxBufferFrames,
         jboolean enableFilters) {
+
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
 
     if (sCaptureEngine) {
         sCaptureEngine->destroy();
@@ -41,6 +60,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeReadSamples(
         jobject /*thiz*/,
         jshortArray dest) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (!sCaptureEngine) {
         LOGE("nativeReadSamples: engine not created");
         return JNI_FALSE;
@@ -61,6 +81,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeStartStream(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (!sCaptureEngine) {
         LOGE("nativeStartStream: engine not created");
         return JNI_FALSE;
@@ -74,6 +95,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeStopStream(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (sCaptureEngine) {
         sCaptureEngine->stopStream();
     }
@@ -84,6 +106,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeDestroy(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (sCaptureEngine) {
         sCaptureEngine->destroy();
         delete sCaptureEngine;
@@ -96,6 +119,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeGetBufferedFrameCount(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     return sCaptureEngine ? sCaptureEngine->getBufferedFrameCount() : 0;
 }
 
@@ -104,6 +128,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeIsRecording(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     return sCaptureEngine ? static_cast<jboolean>(sCaptureEngine->isRecording()) : JNI_FALSE;
 }
 
@@ -112,6 +137,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeGetXRunCount(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     return sCaptureEngine ? sCaptureEngine->getXRunCount() : 0;
 }
 
@@ -129,6 +155,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeConfigureEncoder(
         jint opusComplexity,
         jint codec2Mode) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (!sCaptureEngine) {
         LOGE("nativeConfigureEncoder: engine not created");
         return JNI_FALSE;
@@ -146,6 +173,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeReadEncodedPacket(
         jobject /*thiz*/,
         jbyteArray dest) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (!sCaptureEngine) {
         LOGE("nativeReadEncodedPacket: engine not created");
         return 0;
@@ -170,6 +198,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeSetCaptureMute(
         jobject /*thiz*/,
         jboolean mute) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (sCaptureEngine) {
         sCaptureEngine->setCaptureMute(mute);
     }
@@ -181,6 +210,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeSetAgcPaused(
         jobject /*thiz*/,
         jboolean paused) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (sCaptureEngine) {
         sCaptureEngine->setAgcPaused(paused);
     }
@@ -191,6 +221,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeDestroyEncoder(
         JNIEnv* /*env*/,
         jobject /*thiz*/) {
 
+    std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (sCaptureEngine) {
         sCaptureEngine->destroyEncoder();
     }

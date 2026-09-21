@@ -418,6 +418,7 @@ class Telephone(
      *
      * @param mode New duplex mode (FULL_DUPLEX or HALF_DUPLEX)
      */
+    @Synchronized
     fun switchMode(mode: Mode) {
         if (activeMode == mode) {
             Log.d(TAG, "Already in mode ${mode.abbreviation}, ignoring")
@@ -471,6 +472,7 @@ class Telephone(
      *
      * @param active True while the PTT button is held (transmitting).
      */
+    @Synchronized
     fun setPttActive(active: Boolean) {
         Log.d(TAG, "PTT active: $active (mode=${activeMode.abbreviation})")
         pttHeld = active
