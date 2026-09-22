@@ -37,6 +37,10 @@ VoiceFilterChain::VoiceFilterChain(int channels, float hpCutoff, float lpCutoff,
 
 VoiceFilterChain::~VoiceFilterChain() = default;
 
+void VoiceFilterChain::setAgcPaused(bool paused) {
+    agcPaused_.store(paused, std::memory_order_relaxed);
+}
+
 void VoiceFilterChain::process(int16_t* samples, int numSamples, int sampleRate) {
     if (numSamples <= 0) return;
 
@@ -76,7 +80,9 @@ void VoiceFilterChain::process(int16_t* samples, int numSamples, int sampleRate)
     // Apply filter chain: HPF → LPF → AGC
     applyHighPass(workBuffer_.get(), numFrames);
     applyLowPass(workBuffer_.get(), numFrames);
-    applyAGC(workBuffer_.get(), numFrames);
+    if (!agcPaused_.load(std::memory_order_relaxed)) {
+        applyAGC(workBuffer_.get(), numFrames);
+    }
 
     // Convert float → int16 with clipping
     for (int i = 0; i < numSamples; ++i) {

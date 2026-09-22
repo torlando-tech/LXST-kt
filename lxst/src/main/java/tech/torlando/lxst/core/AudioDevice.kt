@@ -131,6 +131,19 @@ class AudioDevice(
     @Volatile
     private var filterChain: AudioFilters.VoiceFilterChain? = null
 
+    // Retained AGC-pause request. A capture restart (e.g. a mid-call profile switch
+    // reconfiguring the LineSource) recreates the VoiceFilterChain with paused=false;
+    // without retaining the requested state the half-duplex listening period would
+    // resume AGC adaptation. Applied to every newly created filter chain below.
+    @Volatile
+    private var agcPaused = false
+
+    // Serializes filter-chain (re)publication + pause restoration with setAgcPaused(),
+    // so a delayed "restore the retained pause" after a capture restart cannot
+    // overwrite a concurrent PTT's AGC resume (the read-agcPaused / write-
+    // chain.agc.paused sequence is atomic with respect to the pause setter).
+    private val filterChainLock = Any()
+
     // Error callbacks (set externally, e.g., by Python call manager via wrapper)
     @Volatile
     private var onRecordingError: ((String) -> Unit)? = null
@@ -467,17 +480,26 @@ class AudioDevice(
         // Initialize Kotlin-native audio filter chain
         // These replace slow Python/CFFI filters (~20-50ms → <1ms per frame)
         if (filtersEnabled) {
-            filterChain =
-                AudioFilters.VoiceFilterChain(
-                    channels = recordChannels,
-                    highPassCutoff = 300f, // Remove low-frequency rumble/hum
-                    lowPassCutoff = 3400f, // Voice band limit
-                    agcTargetDb = -12f, // Target level for AGC
-                    agcMaxGain = 12f, // Max gain boost
-                )
+            // Publish + restore atomically so a concurrent PTT AGC resume is not
+            // clobbered by the retained-pause restore (Greptile P2).
+            synchronized(filterChainLock) {
+                filterChain =
+                    AudioFilters.VoiceFilterChain(
+                        channels = recordChannels,
+                        highPassCutoff = 300f, // Remove low-frequency rumble/hum
+                        lowPassCutoff = 3400f, // Voice band limit
+                        agcTargetDb = -12f, // Target level for AGC
+                        agcMaxGain = 12f, // Max gain boost
+                    )
+                // A capture restart (e.g. mid-call profile switch) must not resume AGC
+                // during a half-duplex listening period - restore the retained pause.
+                filterChain?.agc?.paused = agcPaused
+            }
             Log.i(TAG, "📞 Kotlin filter chain initialized: HP=300Hz LP=3400Hz AGC=-12dB (max +12dB)")
         } else {
-            filterChain = null
+            synchronized(filterChainLock) {
+                filterChain = null
+            }
             Log.i(TAG, "📞 Kotlin filters DISABLED")
         }
 
@@ -671,19 +693,24 @@ class AudioDevice(
 
         // If recording is active, reinitialize filter chain
         if (isRecording.get()) {
-            if (enabled) {
-                filterChain =
-                    AudioFilters.VoiceFilterChain(
-                        channels = recordChannels,
-                        highPassCutoff = 300f,
-                        lowPassCutoff = 3400f,
-                        agcTargetDb = -12f,
-                        agcMaxGain = 12f,
-                    )
-                Log.i(TAG, "📞 Filter chain reinitialized while recording")
-            } else {
-                filterChain = null
-                Log.i(TAG, "📞 Filter chain disabled while recording")
+            // Publish + restore atomically (same reasoning as startRecording): a
+            // concurrent PTT AGC resume must not be clobbered by the retained pause.
+            synchronized(filterChainLock) {
+                if (enabled) {
+                    filterChain =
+                        AudioFilters.VoiceFilterChain(
+                            channels = recordChannels,
+                            highPassCutoff = 300f,
+                            lowPassCutoff = 3400f,
+                            agcTargetDb = -12f,
+                            agcMaxGain = 12f,
+                        )
+                    filterChain?.agc?.paused = agcPaused
+                    Log.i(TAG, "📞 Filter chain reinitialized while recording")
+                } else {
+                    filterChain = null
+                    Log.i(TAG, "📞 Filter chain disabled while recording")
+                }
             }
         }
     }
@@ -694,6 +721,30 @@ class AudioDevice(
     fun areFiltersEnabled(): Boolean = filtersEnabled
 
     // ===== Voice Call Audio Mode (for Oboe path) =====
+
+    /**
+     * Pause or resume the Kotlin AGC stage (Phase 2 capture filter chain).
+     *
+     * When paused, AGC is bypassed so gain state does not drift while half-duplex
+     * transmit is squelched (PTT not held). Matches Python LXST AGC.paused. No-op
+     * when the filter chain is disabled (filtersEnabled = false).
+     *
+     * The native Oboe capture path (Phase 3) is paused separately via
+     * [tech.torlando.lxst.audio.NativeCaptureEngine.setAgcPaused].
+     *
+     * @param paused True to pause AGC, false to resume.
+     */
+    fun setAgcPaused(paused: Boolean) {
+        // Retain the request so a filter chain recreated by a later capture restart
+        // (e.g. mid-call profile switch) re-applies it instead of resuming AGC. Held
+        // with filterChainLock so this read-retained/write-chain sequence is atomic
+        // with a restart's publish+restore (Greptile P2 "Restoration can undo AGC
+        // resume"): a PTT AGC resume can no longer be clobbered by a delayed restore.
+        synchronized(filterChainLock) {
+            agcPaused = paused
+            filterChain?.agc?.paused = paused
+        }
+    }
 
     /**
      * Set audio mode to MODE_IN_COMMUNICATION and configure speaker/earpiece routing.

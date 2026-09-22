@@ -13,6 +13,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 // TODO: Future reorganization (Option B) — redistribute core/ classes by domain:
 //   CallCoordinator, CallState → telephone/
@@ -36,9 +37,19 @@ import kotlinx.coroutines.launch
  * @see AudioDevice Reference implementation for singleton pattern
  * @see CallCoordinator Reference implementation for Python callback pattern
  */
+// Pairs (frame, capturedEpoch) for in-flight packets so the consumer can detect
+// a squelch that happened after the packet was enqueued. Internal so the unit
+// tests can enqueue packets directly to exercise the consumer's epoch gate.
+internal class QueuedPacket(val frame: ByteArray, val epoch: Int)
+
 @Suppress("TooManyFunctions")
 class PacketRouter private constructor(
     @Suppress("UNUSED_PARAMETER") context: Context,
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob()),
+    private val packetChannel: Channel<QueuedPacket> = Channel(
+        capacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    ),
 ) {
     companion object {
         private const val TAG = "LXST:PacketRouter"
@@ -66,18 +77,36 @@ class PacketRouter private constructor(
                 instance = null
             }
         }
+
+        /**
+         * Test-only constructor: inject a [scope] (typically a [StandardTestDispatcher]
+         * scope) and a [packetChannel] the test can observe and drive deterministically.
+         * Production always uses the defaults (Dispatchers.IO + a 16-deep DROP_OLDEST
+         * channel) via [getInstance]; this is only for the unit tests that assert the
+         * consumer's squelch gate against a controlled backlog.
+         */
+        internal fun forTesting(
+            context: Context,
+            scope: CoroutineScope,
+            packetChannel: Channel<QueuedPacket>,
+        ): PacketRouter = PacketRouter(context, scope, packetChannel)
     }
 
-    // Dedicated IO scope for non-blocking transport calls
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Half-duplex transmit squelch. When true, sendPacket() drops audio frames
+    // so nothing is transmitted on the wire (matches Python LXST Packetizer.squelch -
+    // the frame is dropped before encoding/sending, not sent as silence).
+    // Signalling (sendSignal) is intentionally NOT squelched: mode/profile
+    // negotiation and call status must flow even while transmit is gated.
+    private val squelched = AtomicBoolean(false)
 
-    // Audio packet channel — serializes outbound calls to prevent
-    // concurrent transport access from multiple IO threads.
-    // DROP_OLDEST provides backpressure: if transport can't keep up, old packets are dropped.
-    private val packetChannel = Channel<ByteArray>(
-        capacity = 16,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
+    // Gate epoch. Monotonically incremented ONLY on squelch() (NOT on unsquelch),
+    // so every squelch invalidates all packets already buffered in [packetChannel]
+    // (captured before the gate closed). The consumer drops any packet whose
+    // captured epoch no longer matches the current one - this prevents a
+    // transport backlog from draining stale TX after PTT release. Reopening
+    // (unsquelch) does not bump the epoch, so packets captured during the open
+    // window remain valid after a squelch -> unsquelch cycle.
+    private val gateEpoch = java.util.concurrent.atomic.AtomicInteger(0)
 
     // TEMP: Diagnostic counter for consumer coroutine
     @Volatile
@@ -88,16 +117,22 @@ class PacketRouter private constructor(
         // This prevents multiple concurrent handler invocations
         // from the Dispatchers.IO thread pool.
         scope.launch {
-            for (packet in packetChannel) {
+            for (queued in packetChannel) {
                 try {
+                    // Enforce the half-duplex squelch at the transport handoff, not just
+                    // at enqueue: packets already buffered when squelch() ran must not
+                    // reach the wire. Drop when the gate is currently closed, or when
+                    // a squelch happened after this packet was captured (epoch mismatch)
+                    // - either way it is stale TX that would delay the peer's turn.
+                    if (squelched.get() || queued.epoch != gateEpoch.get()) continue
                     val handler = packetHandler
                     if (handler == null) {
                         if (consumerDeliveryCount < 5) Log.w(TAG, "Consumer: handler null, dropping packet")
                     } else {
-                        handler.receiveAudioPacket(packet)
+                        handler.receiveAudioPacket(queued.frame)
                         consumerDeliveryCount++
                         if (consumerDeliveryCount <= 5 || consumerDeliveryCount % 100 == 0) {
-                            Log.w(TAG, "Consumer delivered #$consumerDeliveryCount (${packet.size} bytes)")
+                            Log.w(TAG, "Consumer delivered #$consumerDeliveryCount (${queued.frame.size} bytes)")
                         }
                     }
                 } catch (e: Exception) {
@@ -133,8 +168,46 @@ class PacketRouter private constructor(
      * @param encodedFrame Encoded audio data (Opus/Codec2/Null bytes with codec header)
      */
     fun sendPacket(encodedFrame: ByteArray) {
-        packetChannel.trySend(encodedFrame)
+        if (squelched.get()) return
+        // Capture the current gate epoch so the consumer can invalidate this
+        // packet if a squelch lands between enqueue and transport handoff.
+        packetChannel.trySend(QueuedPacket(encodedFrame, gateEpoch.get()))
     }
+
+    /**
+     * Squelch (gate) outbound audio transmission.
+     *
+     * While squelched, [sendPacket] drops frames so nothing is transmitted on the
+     * wire - this is the half-duplex PTT "not talking" state. Matches Python LXST
+     * `Packetizer.squelch()` (frame dropped, no TX). Signalling is unaffected.
+     *
+     * Bumping [gateEpoch] additionally invalidates any packets already buffered in
+     * [packetChannel] so the consumer drops them rather than draining a stale TX
+     * backlog onto the wire.
+     *
+     * **CRITICAL:** No Log.d() - may be called from the audio thread.
+     */
+    fun squelch() {
+        squelched.set(true)
+        gateEpoch.incrementAndGet()
+    }
+
+    /**
+     * Resume outbound audio transmission (clear the half-duplex squelch).
+     *
+     * Does not touch [gateEpoch] (it only advances on [squelch]), so this does not
+     * invalidate packets captured during the open window.
+     *
+     * **CRITICAL:** No Log.d() - may be called from the audio thread.
+     */
+    fun unsquelch() {
+        squelched.set(false)
+    }
+
+    /**
+     * @return true while outbound audio is squelched (half-duplex not transmitting).
+     */
+    fun isSquelched(): Boolean = squelched.get()
 
     /**
      * Send signalling to the network transport.
@@ -262,6 +335,8 @@ class PacketRouter private constructor(
      */
     fun shutdown() {
         Log.i(TAG, "Shutting down network bridge")
+        squelched.set(false)
+        gateEpoch.set(0)
         packetChannel.close()
         scope.cancel()
         packetHandler = null

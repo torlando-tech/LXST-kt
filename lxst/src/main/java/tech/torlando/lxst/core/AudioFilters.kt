@@ -57,6 +57,11 @@ object AudioFilters {
         var attackCoeff: Float = 0f
         var releaseCoeff: Float = 0f
         var holdSamples: Int = 0
+        // When paused, AGC is bypassed (frames pass through unmodified). Matches
+        // Python LXST Filters.AGC.paused. Set true while half-duplex transmit is
+        // squelched (PTT not held) so the gain state does not drift on silence.
+        @Volatile
+        var paused: Boolean = false
     }
 
     /**
@@ -101,7 +106,9 @@ object AudioFilters {
             // Apply filter chain
             applyHighPass(floatSamples, numSamples, channels, sampleRate, highPassCutoff, highPass)
             applyLowPass(floatSamples, numSamples, channels, sampleRate, lowPassCutoff, lowPass)
-            applyAGC(floatSamples, numSamples, channels, sampleRate, agcTargetDb, agcMaxGain, agc)
+            if (!agc.paused) {
+                applyAGC(floatSamples, numSamples, channels, sampleRate, agcTargetDb, agcMaxGain, agc)
+            }
 
             // Convert float back to short with clipping
             for (i in samples.indices) {

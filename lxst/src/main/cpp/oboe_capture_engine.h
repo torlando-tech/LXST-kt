@@ -106,6 +106,15 @@ public:
      */
     void setCaptureMute(bool mute);
 
+    /**
+     * Pause or resume the native AGC stage.
+     *
+     * When paused, AGC is bypassed. Set true while half-duplex transmit is
+     * squelched (PTT not held) so gain state does not drift on silence.
+     * No-op if the filter chain is disabled.
+     */
+    void setAgcPaused(bool paused);
+
     /** Destroy the native encoder, freeing codec resources. */
     void destroyEncoder();
 
