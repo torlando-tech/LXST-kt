@@ -7,7 +7,10 @@
 
 #include <oboe/Oboe.h>
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <memory>
+#include <vector>
 #include "packet_ring_buffer.h"
 #include "native_audio_filters.h"
 #include "codec_wrapper.h"
@@ -155,14 +158,29 @@ private:
 
     // Capture-rate → encoder-rate resampler (Phase 3). The Oboe capture stream
     // runs at the hardware rate, but the encoder is configured at the profile's
-    // native rate. When they differ, resample the filtered frame to the encoder
-    // rate before encoding - this mirrors Python LXST, where the codec resamples
-    // the source (mic) rate to its native rate inside encode() (Codec2.py:66-69,
-    // Opus.py:142-145). Disabled (identity) when the rates match.
+    // native rate. When they differ we resample the filtered frame to the
+    // encoder rate before encoding - mirroring Python LXST, where the codec
+    // resamples the source (mic) rate to its native rate inside encode()
+    // (Codec2.py:66-69, Opus.py:142-145). Disabled (identity) when they match.
+    //
+    // The resampled (encoder-rate) samples are appended to encAccum_ rather than
+    // encoded one capture frame at a time: the codec frame size is a function of
+    // the ENCODER rate (Codec2 @8k = 160, Opus @48k = 960), and a resampled
+    // capture frame can be shorter (downsample) or longer (upsample) than it,
+    // and a fixed-size scratch buffer would truncate an upsampled frame. So we
+    // accumulate encoder-rate samples and emit only whole encoder-frame chunks,
+    // guaranteeing every encode() call gets an exact codec frame.
     SampleRateConverter resampler_;
     int captureRate_ = 0;   // actual Oboe input stream rate (set in openStream)
     int encoderRate_ = 0;   // encoder's native rate (set in configureEncoder)
-    std::unique_ptr<int16_t[]> resampleBuf_;  // resampled frame (upsample can grow it)
+    int encoderFrameSize_ = 0;  // samples per encoder frame (encoder-rate frame)
+    std::unique_ptr<int16_t[]> encAccum_;  // encoder-rate accumulator
+    int encAccumCount_ = 0;  // samples currently accumulated
+    int encAccumCap_ = 0;    // capacity of encAccum_ in samples
+    // Per-burst resample scratch: one capture-rate frame resampled to encoder
+    // rate. Sized from the ACTUAL rate ratio in openStream() so a large
+    // upsample (e.g. 8k capture -> 48k encoder = 6x) is never truncated.
+    std::unique_ptr<int16_t[]> resampleBuf_;
     int resampleCap_ = 0;   // capacity of resampleBuf_ in samples
 
     // Pre-allocated encode output buffer (max Opus output ~1275 bytes)

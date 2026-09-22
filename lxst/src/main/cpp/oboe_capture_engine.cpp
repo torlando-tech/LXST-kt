@@ -32,11 +32,14 @@ bool OboeCaptureEngine::create(int sampleRate, int channels, int frameSamples,
     accumBuffer_ = std::make_unique<int16_t[]>(frameSamples);
     accumCount_ = 0;
 
-    // Resample output buffer (Phase 3). Resampling the capture-rate frame to a
-    // higher encoder rate can GROW it (e.g. 24k capture -> 48k encoder = 2x),
-    // so size it for up to 4x the frame to cover the largest real ratio with
-    // headroom. Unused (identity) when capture rate == encoder rate.
-    resampleCap_ = frameSamples * 4;
+    // Per-burst resample scratch (Phase 3). A single capture-rate frame can grow
+    // when resampled to a higher encoder rate (e.g. 24k capture -> 48k encoder
+    // = 2x), so size it generously; the resampler never returns more than
+    // (inLen * encoderRate / captureRate) samples. The encoder-rate ACCUMULATOR
+    // (encAccum_) is allocated in configureEncoder() once the encoder frame size
+    // is known, and emits whole encoder frames so every encode() gets an exact
+    // codec frame (see header comment). Unused (identity) when rates match.
+    resampleCap_ = frameSamples * 8;
     resampleBuf_ = std::make_unique<int16_t[]>(resampleCap_);
 
     if (enableFilters) {
@@ -146,10 +149,38 @@ bool OboeCaptureEngine::openStream() {
     // profile's native rate; when it differs from the hardware capture rate we
     // resample before encoding (matches Python LXST's encode-time resample).
     captureRate_ = stream_->getSampleRate();
-    if (encodeInCallback_ && encoder_) {
+    if (encodeInCallback_ && encoder_ && captureRate_ > 0 && encoderRate_ > 0) {
         resampler_.configure(captureRate_, encoderRate_);
-        LOGI("TX resampler: capture=%d -> encoder=%d (%s)",
-             captureRate_, encoderRate_, resampler_.enabled() ? "active" : "identity");
+
+        // Size the per-burst resample scratch from the ACTUAL rate ratio. A
+        // single capture-rate frame (frameSamples_) resampled to a higher
+        // encoder rate grows by encoderRate_/captureRate_; sizing from the
+        // configured ratio (not a fixed multiple) means even a large upsample
+        // (e.g. 8k capture -> 48k encoder = 6x) is never truncated.
+        double ratio = static_cast<double>(encoderRate_) / static_cast<double>(captureRate_);
+        int maxOut = frameSamples_ +
+            static_cast<int>(std::ceil(frameSamples_ * ratio));
+        if (!resampleBuf_ || resampleCap_ < maxOut) {
+            resampleBuf_ = std::make_unique<int16_t[]>(maxOut);
+            resampleCap_ = maxOut;
+        }
+
+        // Re-size the encoder-rate accumulator for this stream. Capacity of
+        // two encoder frames comfortably holds the carry-over (a partial
+        // frame) plus one full resampled capture frame at the worst ratio.
+        if (encoderFrameSize_ > 0) {
+            int cap = encoderFrameSize_ * 2;
+            if (!encAccum_ || encAccumCap_ != cap) {
+                encAccum_.reset();  // discard any carried samples across restart
+                encAccumCount_ = 0;
+                encAccumCap_ = cap;
+                encAccum_ = std::make_unique<int16_t[]>(encAccumCap_);
+            }
+        }
+
+        LOGI("TX resampler: capture=%d -> encoder=%d (%s), encFrame=%d, scratchCap=%d",
+             captureRate_, encoderRate_, resampler_.enabled() ? "active" : "identity",
+             encoderFrameSize_, resampleCap_);
     }
 
     // Set isRecording_ BEFORE requestStart() to avoid a race condition:
@@ -222,40 +253,76 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
                 filterChain_->process(frameData, frameSamples_, sampleRate_);
             }
 
-            if (encodeInCallback_ && encoder_ && encodedRingBuffer_) {
+            if (encodeInCallback_ && encoder_ && encodedRingBuffer_ &&
+                encoderFrameSize_ > 0 && encAccum_) {
                 // Phase 3: Encode directly in callback → encoded ring buffer.
-                // Resample the filtered frame (capture rate) to the encoder's
-                // native rate first when they differ - the encoder is configured
-                // at the profile's rate (e.g. Codec2 @8k, Opus @48k) but the Oboe
-                // capture stream runs at the hardware rate (e.g. 24k). Without this
-                // the codec would encode audio at the wrong pitch. Mirrors Python
-                // LXST's encode-time resample (Codec2.py:66-69, Opus.py:142-145).
-                const int16_t* encIn = frameData;
-                int encSamples = frameSamples_;
+                //
+                // Bring this capture frame to the ENCODER rate. The encoder is
+                // configured at the profile's native rate (e.g. Codec2 @8k, Opus
+                // @48k) but the Oboe capture stream runs at the hardware rate
+                // (e.g. 24k), so resample first - mirroring Python LXST's
+                // encode-time resample (Codec2.py:66-69, Opus.py:142-145). In
+                // identity mode (rates match) we use the filtered frame as-is.
+                const int16_t* encRatePcm = frameData;
+                int encRateSamples = frameSamples_;
                 if (resampler_.enabled() && resampleBuf_) {
                     int n = resampler_.process(frameData, frameSamples_,
                                                resampleBuf_.get(), resampleCap_);
-                    if (n > 0) {
-                        encIn = resampleBuf_.get();
-                        encSamples = n;
-                    } else {
-                        // No output this frame (insufficient input for the
-                        // output rate, or buffer too small) - nothing to encode.
-                        // accumCount_ is reset below; the resampler carries its
-                        // phase into the next frame.
-                        encSamples = 0;
+                    if (n < 0) {
+                        // Scratch too small (should not happen: sized from the
+                        // actual ratio in openStream). Skip this burst rather
+                        // than risk a truncated feed.
+                        LOGE("TX resample overflow: in=%d cap=%d",
+                             frameSamples_, resampleCap_);
+                        n = 0;
                     }
+                    encRatePcm = resampleBuf_.get();
+                    encRateSamples = n;
                 }
-                if (encSamples > 0) {
-                    int encodedLen = encoder_->encode(encIn, encSamples,
-                                                      encodeBuf_, sizeof(encodeBuf_));
-                    if (encodedLen > 0) {
-                        if (!encodedRingBuffer_->write(encodeBuf_, encodedLen)) {
-                            // Encoded ring buffer full — drop (consumer too slow)
-                            uint8_t discard[1];
-                            int discardLen;
-                            encodedRingBuffer_->read(discard, 1, &discardLen);
-                            encodedRingBuffer_->write(encodeBuf_, encodedLen);
+
+                // Append the encoder-rate samples to the accumulator, then emit
+                // complete encoder-frame chunks. The codec frame size is a
+                // function of the ENCODER rate and a single resampled capture
+                // frame can be shorter (downsample) or longer (upsample) than it
+                // - plus a fractional carry-over - so we accumulate and emit only
+                // whole frames. This guarantees every encode() call gets an exact
+                // codec frame: Opus rejects non-standard sizes (P2: 958 != 960
+                // dropped the first packet), and Codec2's numFrames = samples /
+                // spf would otherwise encode 0 frames from a truncated buffer
+                // (P1: silence). Identity mode has encRateSamples ==
+                // encoderFrameSize_, so it emits exactly one chunk per frame with
+                // no carry - identical to the pre-fix behaviour.
+                if (encRateSamples > 0) {
+                    int room = encAccumCap_ - encAccumCount_;
+                    if (encRateSamples > room) {
+                        // Accumulator sized for 2x an encoder frame and the
+                        // carry is always < 1 frame, so this never triggers; cap
+                        // defensively to keep the buffer bounded regardless.
+                        encRateSamples = room;
+                    }
+                    std::memcpy(encAccum_.get() + encAccumCount_, encRatePcm,
+                                sizeof(int16_t) * encRateSamples);
+                    encAccumCount_ += encRateSamples;
+
+                    while (encAccumCount_ >= encoderFrameSize_) {
+                        int encodedLen = encoder_->encode(
+                            encAccum_.get(), encoderFrameSize_,
+                            encodeBuf_, sizeof(encodeBuf_));
+                        if (encodedLen > 0) {
+                            if (!encodedRingBuffer_->write(encodeBuf_, encodedLen)) {
+                                // Encoded ring buffer full — drop (consumer too slow)
+                                uint8_t discard[1];
+                                int discardLen;
+                                encodedRingBuffer_->read(discard, 1, &discardLen);
+                                encodedRingBuffer_->write(encodeBuf_, encodedLen);
+                            }
+                        }
+                        // Shift the remainder to the front for the next burst.
+                        encAccumCount_ -= encoderFrameSize_;
+                        if (encAccumCount_ > 0) {
+                            std::memmove(encAccum_.get(),
+                                         encAccum_.get() + encoderFrameSize_,
+                                         sizeof(int16_t) * encAccumCount_);
                         }
                     }
                 }
@@ -306,12 +373,29 @@ bool OboeCaptureEngine::configureEncoder(int codecType, int sampleRate, int chan
     encoderRate_ = sampleRate;
     resampler_.reset();
 
+    // Samples per encoder frame. The codec frame size is a function of the
+    // ENCODER rate (Codec2 @8k = 160, Opus @48k = 960 for a 20ms frame), so the
+    // encoder-rate accumulator emits chunks of this size - not the capture-rate
+    // frameSamples_ - guaranteeing every encode() call gets an exact codec frame
+    // (Opus rejects non-standard sizes; Codec2's numFrames = samples / spf would
+    // otherwise drop a truncated frame). frameSamples_ is frameDurationMs at the
+    // requested (sampleRate_) rate, so the same duration at the encoder rate is:
+    encoderFrameSize_ = static_cast<int>(
+        frameSamples_ * (static_cast<double>(sampleRate) / sampleRate_) + 0.5);
+
     // Encoded ring buffer: 32 slots, 1500 bytes max per slot
     encodedRingBuffer_ = std::make_unique<EncodedRingBuffer>(32, 1500);
 
     // Pre-allocate silence buffer for mute
     silenceBuf_ = std::make_unique<int16_t[]>(frameSamples_);
     std::memset(silenceBuf_.get(), 0, sizeof(int16_t) * frameSamples_);
+
+    // Encoder-rate accumulator. openStream() re-sizes this once the actual
+    // capture rate is known; allocate a sensible default now so the engine is
+    // usable even if configureEncoder() runs before the first stream open.
+    encAccumCount_ = 0;
+    encAccumCap_ = encoderFrameSize_ * 2;
+    encAccum_ = std::make_unique<int16_t[]>(encAccumCap_);
 
     encodeInCallback_ = true;
 
@@ -339,6 +423,10 @@ void OboeCaptureEngine::destroyEncoder() {
     encoder_.reset();
     encodedRingBuffer_.reset();
     silenceBuf_.reset();
+    encAccum_.reset();
+    encAccumCount_ = 0;
+    encAccumCap_ = 0;
+    encoderFrameSize_ = 0;
 }
 
 // --- Oboe error callback (stream disconnect recovery) ---
