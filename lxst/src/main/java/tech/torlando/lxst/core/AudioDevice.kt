@@ -131,6 +131,13 @@ class AudioDevice(
     @Volatile
     private var filterChain: AudioFilters.VoiceFilterChain? = null
 
+    // Retained AGC-pause request. A capture restart (e.g. a mid-call profile switch
+    // reconfiguring the LineSource) recreates the VoiceFilterChain with paused=false;
+    // without retaining the requested state the half-duplex listening period would
+    // resume AGC adaptation. Applied to every newly created filter chain below.
+    @Volatile
+    private var agcPaused = false
+
     // Error callbacks (set externally, e.g., by Python call manager via wrapper)
     @Volatile
     private var onRecordingError: ((String) -> Unit)? = null
@@ -475,6 +482,9 @@ class AudioDevice(
                     agcTargetDb = -12f, // Target level for AGC
                     agcMaxGain = 12f, // Max gain boost
                 )
+            // A capture restart (e.g. mid-call profile switch) must not resume AGC
+            // during a half-duplex listening period - restore the retained pause.
+            filterChain?.agc?.paused = agcPaused
             Log.i(TAG, "📞 Kotlin filter chain initialized: HP=300Hz LP=3400Hz AGC=-12dB (max +12dB)")
         } else {
             filterChain = null
@@ -680,6 +690,7 @@ class AudioDevice(
                         agcTargetDb = -12f,
                         agcMaxGain = 12f,
                     )
+                filterChain?.agc?.paused = agcPaused
                 Log.i(TAG, "📞 Filter chain reinitialized while recording")
             } else {
                 filterChain = null
@@ -708,6 +719,9 @@ class AudioDevice(
      * @param paused True to pause AGC, false to resume.
      */
     fun setAgcPaused(paused: Boolean) {
+        // Retain the request so a filter chain recreated by a later capture restart
+        // (e.g. mid-call profile switch) re-applies it instead of resuming AGC.
+        agcPaused = paused
         filterChain?.agc?.paused = paused
     }
 

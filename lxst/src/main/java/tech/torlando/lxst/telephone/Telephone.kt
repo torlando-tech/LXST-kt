@@ -508,10 +508,17 @@ class Telephone(
 
     /**
      * Pause or resume AGC on the capture path (Kotlin filter chain and native engine).
+     *
+     * The native capture filter chain (OboeLineSource) always runs C++ AGC when
+     * native playback is active, regardless of which codec backend encodes the frames
+     * (useNativeCodec only changes where encode happens). So the native AGC pause is
+     * gated on the capture backend (useNativePlayback), not the codec backend -
+     * otherwise the OboeLineSource-with-Kotlin-codec path would keep AGC adapting
+     * through the whole HDX listening period instead of preserving gain.
      */
     private fun setAgcPaused(paused: Boolean) {
         audioBridge.setAgcPaused(paused)
-        if (useNativeCodec && useNativePlayback) {
+        if (useNativePlayback) {
             NativeCaptureEngine.setAgcPaused(paused)
         }
     }
@@ -1021,10 +1028,18 @@ class Telephone(
         // Set MODE_IN_COMMUNICATION before starting Oboe streams.
         // In the non-Oboe path, LineSink/LineSource do this via AudioDevice.startPlayback/
         // startRecording. In the Oboe path, we must do it explicitly so the system knows
-        // we're in a voice call and routes audio through the voice call volume stream.
+        // it's in a voice call and routes audio through the voice call volume stream.
         if (useNativePlayback) {
             audioBridge.enterVoiceCallMode(speakerphone = false)
         }
+
+        // Close the transmit gate (router squelch) BEFORE capture starts so a
+        // pre-selected half-duplex call never leaks mic audio to the peer (Greptile P1
+        // "Capture starts before HDX gating"). Only the router squelch here: the AGC
+        // pause needs the capture filter chain / native engine, which is created in
+        // start() below, so it is applied by the full gate re-apply after the producers
+        // start (preserving the original AGC ordering).
+        if (gated()) networkPacketBridge.squelch()
 
         receiveMixer?.start()
         transmitMixer?.start()
@@ -1032,10 +1047,9 @@ class Telephone(
         linkSource?.start()
         packetizer?.start()
 
-        // Re-apply the half-duplex transmit gate now that the packetizer is running.
-        // Matches Python __select_call_mode(self.active_call.call_mode) on pipeline
-        // open (Telephony.py line 673) - a mode selected pre-established takes effect
-        // once the TX pipeline exists.
+        // Apply the full gate now that the capture path exists, so the AGC pause takes
+        // effect on the freshly created engine/filter chain and the gate is consistent
+        // with the current mode (Python Telephony.py line 673 re-apply on pipeline open).
         applyTransmitGate()
 
         Log.i(TAG, "Audio pipelines started")

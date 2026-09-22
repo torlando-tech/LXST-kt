@@ -24,6 +24,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import tech.torlando.lxst.audio.Signalling
 import tech.torlando.lxst.core.AudioDevice
 import tech.torlando.lxst.core.CallCoordinator
@@ -55,6 +58,15 @@ class TelephoneModeTest {
 
     private var signalCallback: ((Int) -> Unit)? = null
 
+    // Final-state tracking: the last gate/AGC action the Telephone applied. Reset per
+    // test and driven by mock side-effects below, so tests can assert the gate's FINAL
+    // state (the last squelch/unsquelch and last AGC pause) rather than relying on
+    // at-least-once verify(), which establishCall's own initial gate calls would
+    // satisfy even if a later transition were a no-op (Greptile P2 "earlier calls
+    // satisfy transition assertions").
+    private var wireSquelched = false
+    private var agcPaused = false
+
     @Before
     fun setup() {
         Dispatchers.setMain(testDispatcher)
@@ -65,11 +77,21 @@ class TelephoneModeTest {
         mockPacketRouter = mockk(relaxed = true)
         mockCallCoordinator = mockk(relaxed = true)
 
+        wireSquelched = false
+        agcPaused = false
+
         val signalSlot = slot<(Int) -> Unit>()
         every { mockTransport.setSignalCallback(capture(signalSlot)) } answers {
             signalCallback = signalSlot.captured
         }
         every { mockTransport.isLinkActive } returns false
+
+        // Record the last gate/AGC action so final-state assertions are discriminating.
+        every { mockPacketRouter.squelch() } answers { wireSquelched = true }
+        every { mockPacketRouter.unsquelch() } answers { wireSquelched = false }
+        every { mockPacketRouter.isSquelched() } answers { wireSquelched }
+        every { mockAudioBridge.setAgcPaused(true) } answers { agcPaused = true }
+        every { mockAudioBridge.setAgcPaused(false) } answers { agcPaused = false }
 
         telephone =
             Telephone(
@@ -175,18 +197,18 @@ class TelephoneModeTest {
         telephone.setPttActive(true)
         telephone.setPttActive(false)
         verify(exactly = 0) { mockPacketRouter.squelch() }
-        // AGC stays running in FDX.
-        verify { mockAudioBridge.setAgcPaused(false) }
-        verify(exactly = 0) { mockAudioBridge.setAgcPaused(true) }
+        // Final gate state: open + AGC running.
+        assertFalse("FDX PTT release must leave the wire open", wireSquelched)
+        assertFalse("FDX PTT release must leave AGC running", agcPaused)
     }
 
     @Test
     fun `entering half duplex with PTT released squelches and pauses AGC`() = runTest {
         establishCall()
         telephone.switchMode(Mode.HALF_DUPLEX)
-        // Steady state: squelched + AGC paused.
-        verify { mockPacketRouter.squelch() }
-        verify { mockAudioBridge.setAgcPaused(true) }
+        // Final gate state: squelched + AGC paused.
+        assertTrue("entering HDX (PTT released) must squelch", wireSquelched)
+        assertTrue("entering HDX (PTT released) must pause AGC", agcPaused)
     }
 
     @Test
@@ -194,8 +216,9 @@ class TelephoneModeTest {
         establishCall()
         telephone.switchMode(Mode.HALF_DUPLEX)
         telephone.setPttActive(true)
-        verify { mockPacketRouter.unsquelch() }
-        verify { mockAudioBridge.setAgcPaused(false) }
+        // Final gate state: open + AGC running.
+        assertFalse("PTT held in HDX must leave the wire open", wireSquelched)
+        assertFalse("PTT held in HDX must resume AGC", agcPaused)
     }
 
     @Test
@@ -204,9 +227,9 @@ class TelephoneModeTest {
         telephone.switchMode(Mode.HALF_DUPLEX)
         telephone.setPttActive(true)
         telephone.setPttActive(false)
-        // Final state after release: squelched + AGC paused.
-        verify { mockPacketRouter.squelch() }
-        verify { mockAudioBridge.setAgcPaused(true) }
+        // Final gate state after release: squelched + AGC paused.
+        assertTrue("PTT released in HDX must re-squelch", wireSquelched)
+        assertTrue("PTT released in HDX must re-pause AGC", agcPaused)
     }
 
     // ===== Remote mode signalling routing =====
@@ -287,7 +310,49 @@ class TelephoneModeTest {
             mockPacketRouter.unsquelch()  // PTT held
             mockPacketRouter.squelch()    // PTT released
         }
-        verify { mockAudioBridge.setAgcPaused(true) }
+        assertTrue("final gate must be squelched", wireSquelched)
+        assertTrue("final AGC must be paused", agcPaused)
+    }
+
+    // ===== True concurrency: overlapping updates must not leave a stale gate =====
+    // Greptile P2 "concurrency tests run sequentially": the tests above complete one
+    // operation before starting the next, so they would pass even if the @Synchronized
+    // annotations were removed. This test genuinely overlaps a remote mode change
+    // (the @Synchronized signal handler) with a local PTT press (the @Synchronized
+    // public entry point) via a start barrier, then asserts the deterministic final
+    // invariant. Whichever block acquires the monitor first, the final inputs are
+    // (mode=HDX, pttHeld=true) and the gate MUST end open; an unsynchronized
+    // read-modify-write would let a stale squelch linger (the original P1).
+    @Test
+    fun `overlapping remote HDX and PTT press ends open regardless of order`() = runTest {
+        establishCall()
+        val go = CountDownLatch(1)
+        val done = CountDownLatch(2)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            executor.execute {
+                go.await()
+                signalCallback?.invoke(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id)
+                done.countDown()
+            }
+            executor.execute {
+                go.await()
+                telephone.setPttActive(true)
+                done.countDown()
+            }
+            // Release both at once so the two synchronized blocks overlap.
+            go.countDown()
+            assertTrue("both operations must complete", done.await(5, TimeUnit.SECONDS))
+
+            // Final inputs are (HDX, PTT held) regardless of interleaving order, so
+            // the gate must end open and AGC running. A stale squelch from the remote
+            // switch (the P1 bug) would leave the wire closed here.
+            assertEquals(Mode.HALF_DUPLEX, telephone.activeMode)
+            assertFalse("PTT held + HDX => wire must be open", wireSquelched)
+            assertFalse("PTT held + HDX => AGC must be running", agcPaused)
+        } finally {
+            executor.shutdownNow()
+        }
     }
 
 
