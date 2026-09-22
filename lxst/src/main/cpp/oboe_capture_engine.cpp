@@ -32,6 +32,13 @@ bool OboeCaptureEngine::create(int sampleRate, int channels, int frameSamples,
     accumBuffer_ = std::make_unique<int16_t[]>(frameSamples);
     accumCount_ = 0;
 
+    // Resample output buffer (Phase 3). Resampling the capture-rate frame to a
+    // higher encoder rate can GROW it (e.g. 24k capture -> 48k encoder = 2x),
+    // so size it for up to 4x the frame to cover the largest real ratio with
+    // headroom. Unused (identity) when capture rate == encoder rate.
+    resampleCap_ = frameSamples * 4;
+    resampleBuf_ = std::make_unique<int16_t[]>(resampleCap_);
+
     if (enableFilters) {
         filterChain_ = std::make_unique<VoiceFilterChain>(
             channels,
@@ -134,6 +141,17 @@ bool OboeCaptureEngine::openStream() {
              stream_->getSampleRate(), sampleRate_);
     }
 
+    // Record the ACTUAL capture rate and (re)configure the capture→encoder
+    // resampler now that we know it. The encoder (if configured) runs at the
+    // profile's native rate; when it differs from the hardware capture rate we
+    // resample before encoding (matches Python LXST's encode-time resample).
+    captureRate_ = stream_->getSampleRate();
+    if (encodeInCallback_ && encoder_) {
+        resampler_.configure(captureRate_, encoderRate_);
+        LOGI("TX resampler: capture=%d -> encoder=%d (%s)",
+             captureRate_, encoderRate_, resampler_.enabled() ? "active" : "identity");
+    }
+
     // Set isRecording_ BEFORE requestStart() to avoid a race condition:
     // The SCHED_FIFO callback can fire immediately after requestStart(),
     // and if isRecording_ is still false, the callback returns Stop,
@@ -205,16 +223,40 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
             }
 
             if (encodeInCallback_ && encoder_ && encodedRingBuffer_) {
-                // Phase 3: Encode directly in callback → encoded ring buffer
-                int encodedLen = encoder_->encode(frameData, frameSamples_,
-                                                  encodeBuf_, sizeof(encodeBuf_));
-                if (encodedLen > 0) {
-                    if (!encodedRingBuffer_->write(encodeBuf_, encodedLen)) {
-                        // Encoded ring buffer full — drop (consumer too slow)
-                        uint8_t discard[1];
-                        int discardLen;
-                        encodedRingBuffer_->read(discard, 1, &discardLen);
-                        encodedRingBuffer_->write(encodeBuf_, encodedLen);
+                // Phase 3: Encode directly in callback → encoded ring buffer.
+                // Resample the filtered frame (capture rate) to the encoder's
+                // native rate first when they differ - the encoder is configured
+                // at the profile's rate (e.g. Codec2 @8k, Opus @48k) but the Oboe
+                // capture stream runs at the hardware rate (e.g. 24k). Without this
+                // the codec would encode audio at the wrong pitch. Mirrors Python
+                // LXST's encode-time resample (Codec2.py:66-69, Opus.py:142-145).
+                const int16_t* encIn = frameData;
+                int encSamples = frameSamples_;
+                if (resampler_.enabled() && resampleBuf_) {
+                    int n = resampler_.process(frameData, frameSamples_,
+                                               resampleBuf_.get(), resampleCap_);
+                    if (n > 0) {
+                        encIn = resampleBuf_.get();
+                        encSamples = n;
+                    } else {
+                        // No output this frame (insufficient input for the
+                        // output rate, or buffer too small) - nothing to encode.
+                        // accumCount_ is reset below; the resampler carries its
+                        // phase into the next frame.
+                        encSamples = 0;
+                    }
+                }
+                if (encSamples > 0) {
+                    int encodedLen = encoder_->encode(encIn, encSamples,
+                                                      encodeBuf_, sizeof(encodeBuf_));
+                    if (encodedLen > 0) {
+                        if (!encodedRingBuffer_->write(encodeBuf_, encodedLen)) {
+                            // Encoded ring buffer full — drop (consumer too slow)
+                            uint8_t discard[1];
+                            int discardLen;
+                            encodedRingBuffer_->read(discard, 1, &discardLen);
+                            encodedRingBuffer_->write(encodeBuf_, encodedLen);
+                        }
                     }
                 }
             } else {
@@ -256,6 +298,13 @@ bool OboeCaptureEngine::configureEncoder(int codecType, int sampleRate, int chan
         encoder_.reset();
         return false;
     }
+
+    // The encoder's native sample rate - the capture stream may run at a
+    // different (hardware) rate, in which case openStream() sizes and configures
+    // the capture→encoder resampler to bridge the gap (see Python LXST's
+    // encode-time resample).
+    encoderRate_ = sampleRate;
+    resampler_.reset();
 
     // Encoded ring buffer: 32 slots, 1500 bytes max per slot
     encodedRingBuffer_ = std::make_unique<EncodedRingBuffer>(32, 1500);

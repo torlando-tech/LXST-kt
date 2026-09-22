@@ -12,6 +12,7 @@
 #include "native_audio_filters.h"
 #include "codec_wrapper.h"
 #include "encoded_ring_buffer.h"
+#include "sample_rate_converter.h"
 
 /**
  * Oboe-based audio capture engine for LXST.
@@ -151,6 +152,18 @@ private:
     std::unique_ptr<int16_t[]> monoToStereoBuf_;  // For SHQ stereo upmix
     std::atomic<bool> captureMuted_{false};
     bool encodeInCallback_ = false;  // True when encoder is configured
+
+    // Capture-rate → encoder-rate resampler (Phase 3). The Oboe capture stream
+    // runs at the hardware rate, but the encoder is configured at the profile's
+    // native rate. When they differ, resample the filtered frame to the encoder
+    // rate before encoding - this mirrors Python LXST, where the codec resamples
+    // the source (mic) rate to its native rate inside encode() (Codec2.py:66-69,
+    // Opus.py:142-145). Disabled (identity) when the rates match.
+    SampleRateConverter resampler_;
+    int captureRate_ = 0;   // actual Oboe input stream rate (set in openStream)
+    int encoderRate_ = 0;   // encoder's native rate (set in configureEncoder)
+    std::unique_ptr<int16_t[]> resampleBuf_;  // resampled frame (upsample can grow it)
+    int resampleCap_ = 0;   // capacity of resampleBuf_ in samples
 
     // Pre-allocated encode output buffer (max Opus output ~1275 bytes)
     uint8_t encodeBuf_[1500];
