@@ -169,9 +169,9 @@ class TelephoneModeTest {
 
         // Signalled PREFERRED_MODE + 0x02 to the peer.
         verify { mockTransport.sendSignal(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id) }
-        // Wire is now squelched (HDX, PTT not held) and AGC paused.
-        verify { mockPacketRouter.squelch() }
-        verify { mockAudioBridge.setAgcPaused(true) }
+        // Final state: wire squelched (HDX, PTT not held) + AGC paused.
+        assertTrue("HDX switch must squelch", wireSquelched)
+        assertTrue("HDX switch must pause AGC", agcPaused)
         assertEquals(Mode.HALF_DUPLEX, telephone.activeMode)
     }
 
@@ -182,9 +182,11 @@ class TelephoneModeTest {
         telephone.switchMode(Mode.FULL_DUPLEX)
 
         verify { mockTransport.sendSignal(Signalling.PREFERRED_MODE + Mode.FULL_DUPLEX.id) }
-        // Final state unsquelched + AGC running.
-        verify { mockPacketRouter.unsquelch() }
-        verify { mockAudioBridge.setAgcPaused(false) }
+        // Final state unsquelched + AGC running. Final-state (not at-least-once) so the
+        // FDX switch itself is what unsquelches, not establishCall's initial gate (which
+        // is overridden to squelched by the HDX switch just before).
+        assertFalse(wireSquelched)
+        assertFalse(agcPaused)
         assertEquals(Mode.FULL_DUPLEX, telephone.activeMode)
     }
 
@@ -240,7 +242,9 @@ class TelephoneModeTest {
         signalCallback?.invoke(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id)
 
         assertEquals(Mode.HALF_DUPLEX, telephone.activeMode)
-        verify { mockPacketRouter.squelch() }
+        // Final state: remote HDX squelches + pauses AGC (PTT not held).
+        assertTrue("remote HDX must squelch", wireSquelched)
+        assertTrue("remote HDX must pause AGC", agcPaused)
         // from_signalling path must not signal the mode back to the peer.
         verify(exactly = 0) { mockTransport.sendSignal(Signalling.PREFERRED_MODE + Mode.HALF_DUPLEX.id) }
     }
@@ -252,7 +256,9 @@ class TelephoneModeTest {
         signalCallback?.invoke(Signalling.PREFERRED_MODE + Mode.FULL_DUPLEX.id)
 
         assertEquals(Mode.FULL_DUPLEX, telephone.activeMode)
-        verify { mockPacketRouter.unsquelch() }
+        // Final state: remote FDX unsquelches + resumes AGC (overrides the HDX squelch).
+        assertFalse("remote FDX must unsquelch", wireSquelched)
+        assertFalse("remote FDX must resume AGC", agcPaused)
     }
 
     // ===== Concurrency: gate state must always reflect the latest inputs =====
@@ -399,9 +405,11 @@ class TelephoneModeTest {
         telephone.hangup()
 
         assertEquals(Mode.FULL_DUPLEX, telephone.activeMode)
-        // Gate cleared on call end.
-        verify { mockPacketRouter.unsquelch() }
-        verify { mockAudioBridge.setAgcPaused(false) }
+        // Final gate state cleared on call end. Final-state (not at-least-once) so the
+        // hangup itself is what clears it, not establishCall's initial gate (which is
+        // overridden to squelched by the HDX switch just before).
+        assertFalse(wireSquelched)
+        assertFalse(agcPaused)
     }
 
     // ===== Gate re-applied on pipeline open =====
