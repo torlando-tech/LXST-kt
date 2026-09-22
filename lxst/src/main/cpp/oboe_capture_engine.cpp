@@ -148,26 +148,23 @@ bool OboeCaptureEngine::openStream() {
     // resampler now that we know it. The encoder (if configured) runs at the
     // profile's native rate; when it differs from the hardware capture rate we
     // resample before encoding (matches Python LXST's encode-time resample).
+    //
+    // NOTE: encoderFrameSize_ is NOT recomputed here. It is the codec-valid
+    // chunk size (profile duration at the ENCODER rate, set in
+    // configureEncoder) and must stay that value regardless of the actual
+    // capture rate - a non-codec-valid chunk (e.g. 4179 from a 44.1k stream)
+    // would be rejected by Opus. When the actual capture rate differs from the
+    // requested one, the accumulator (sized below) simply spans more/fewer
+    // capture bursts to emit whole codec-valid frames.
     captureRate_ = stream_->getSampleRate();
     if (encodeInCallback_ && encoder_ && captureRate_ > 0 && encoderRate_ > 0) {
         resampler_.configure(captureRate_, encoderRate_);
 
-        // Derive the encoder-frame size from the ACTUAL capture rate. The
-        // capture loop accumulates frameSamples_ samples of CAPTURE-rate audio
-        // before filtering (that is frameDurationMs of audio at the capture
-        // rate); resampled to the encoder rate, that same duration is
-        // frameSamples_ × (encoderRate/captureRate) samples. Computing it here
-        // (not in configureEncoder) makes it robust to a phone that ignores the
-        // requested rate and reports a different actual one.
-        encoderFrameSize_ = static_cast<int>(
-            frameSamples_ * (static_cast<double>(encoderRate_) /
-                             static_cast<double>(captureRate_)) + 0.5);
-
         // Size the per-burst resample scratch from the ACTUAL rate ratio. A
-        // single capture-rate frame (frameSamples_) resampled to a higher
-        // encoder rate grows by encoderRate_/captureRate_; sizing from the
-        // configured ratio (not a fixed multiple) means even a large upsample
-        // (e.g. 8k capture -> 48k encoder = 6x) is never truncated.
+        // single capture-rate frame (frameSamples_) resampled to the encoder
+        // rate grows by encoderRate_/captureRate_; sizing from the actual ratio
+        // (not a fixed multiple) means even a large upsample is never
+        // truncated.
         double ratio = static_cast<double>(encoderRate_) / static_cast<double>(captureRate_);
         int maxOut = frameSamples_ +
             static_cast<int>(std::ceil(frameSamples_ * ratio));
@@ -176,11 +173,14 @@ bool OboeCaptureEngine::openStream() {
             resampleCap_ = maxOut;
         }
 
-        // Re-size the encoder-rate accumulator for this stream. Capacity of
-        // two encoder frames comfortably holds the carry-over (a partial
-        // frame) plus one full resampled capture frame at the worst ratio.
+        // Re-size the encoder-rate accumulator for this stream. The carry-over
+        // is always < 1 codec frame; one full capture frame, resampled,
+        // contributes up to frameSamples_ * ratio encoder-rate samples (maxOut
+        // above). Capacity of (one codec frame + that max intake) holds both,
+        // so even a large downsample (LBW 3x) can't overflow and drop samples,
+        // and a large upsample never triggers the defensive cap.
         if (encoderFrameSize_ > 0) {
-            int cap = encoderFrameSize_ * 2;
+            int cap = encoderFrameSize_ + maxOut;
             if (!encAccum_ || encAccumCap_ != cap) {
                 encAccum_.reset();  // discard any carried samples across restart
                 encAccumCount_ = 0;
@@ -189,9 +189,9 @@ bool OboeCaptureEngine::openStream() {
             }
         }
 
-        LOGI("TX resampler: capture=%d -> encoder=%d (%s), encFrame=%d, scratchCap=%d",
+        LOGI("TX resampler: capture=%d -> encoder=%d (%s), encFrame=%d, scratchCap=%d, accCap=%d",
              captureRate_, encoderRate_, resampler_.enabled() ? "active" : "identity",
-             encoderFrameSize_, resampleCap_);
+             encoderFrameSize_, resampleCap_, encAccumCap_);
     }
 
     // Set isRecording_ BEFORE requestStart() to avoid a race condition:
