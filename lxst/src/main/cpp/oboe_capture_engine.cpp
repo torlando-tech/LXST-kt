@@ -152,6 +152,17 @@ bool OboeCaptureEngine::openStream() {
     if (encodeInCallback_ && encoder_ && captureRate_ > 0 && encoderRate_ > 0) {
         resampler_.configure(captureRate_, encoderRate_);
 
+        // Derive the encoder-frame size from the ACTUAL capture rate. The
+        // capture loop accumulates frameSamples_ samples of CAPTURE-rate audio
+        // before filtering (that is frameDurationMs of audio at the capture
+        // rate); resampled to the encoder rate, that same duration is
+        // frameSamples_ × (encoderRate/captureRate) samples. Computing it here
+        // (not in configureEncoder) makes it robust to a phone that ignores the
+        // requested rate and reports a different actual one.
+        encoderFrameSize_ = static_cast<int>(
+            frameSamples_ * (static_cast<double>(encoderRate_) /
+                             static_cast<double>(captureRate_)) + 0.5);
+
         // Size the per-burst resample scratch from the ACTUAL rate ratio. A
         // single capture-rate frame (frameSamples_) resampled to a higher
         // encoder rate grows by encoderRate_/captureRate_; sizing from the
