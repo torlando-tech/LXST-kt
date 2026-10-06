@@ -4,6 +4,7 @@
 
 #include "oboe_capture_engine.h"
 #include <android/log.h>
+#include <oboe/OboeExtensions.h>
 #include <cstring>
 
 #define LOG_TAG "LXST:OboeCaptureEngine"
@@ -113,9 +114,15 @@ int OboeCaptureEngine::getXRunCount() const {
 bool OboeCaptureEngine::openStream() {
     oboe::AudioStreamBuilder builder;
 
+    // Input uses the legacy (non-MMAP) shared path. LowLatency+Exclusive lets
+    // AAudio pick an exclusive MMAP input stream, which on some Samsung Exynos
+    // devices (e.g. Galaxy A35) opens and runs without error but delivers
+    // silence in MODE_IN_COMMUNICATION with the VoiceCommunication preset.
+    // The added latency (20 ms bursts vs 4 ms) is negligible next to codec
+    // frame times.
     builder.setDirection(oboe::Direction::Input)
-           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-           ->setSharingMode(oboe::SharingMode::Exclusive)
+           ->setPerformanceMode(oboe::PerformanceMode::None)
+           ->setSharingMode(oboe::SharingMode::Shared)
            ->setFormat(oboe::AudioFormat::I16)
            ->setSampleRate(sampleRate_)
            ->setChannelCount(channels_)
@@ -131,8 +138,12 @@ bool OboeCaptureEngine::openStream() {
         return false;
     }
 
-    LOGI("Input stream opened: API=%s, rate=%d (requested=%d), ch=%d, framesPerBurst=%d, bufferCapacity=%d",
+    LOGI("Input stream opened: API=%s, mmap=%d, sharing=%s, perf=%s, deviceId=%d, rate=%d (requested=%d), ch=%d, framesPerBurst=%d, bufferCapacity=%d",
          stream_->getAudioApi() == oboe::AudioApi::AAudio ? "AAudio" : "OpenSLES",
+         stream_->usesAAudio() ? static_cast<int>(oboe::OboeExtensions::isMMapUsed(stream_.get())) : 0,
+         oboe::convertToText(stream_->getSharingMode()),
+         oboe::convertToText(stream_->getPerformanceMode()),
+         stream_->getDeviceId(),
          stream_->getSampleRate(),
          sampleRate_,
          stream_->getChannelCount(),
