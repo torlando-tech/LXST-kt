@@ -34,7 +34,7 @@ includeBuild("LXST-kt") {
 LXST Copyright 2026 Mark Qvist. 
 
 This implementation of LXST is derived from the LXST Python implementation,
-and used under license for Columba. No derivatives or use outside Columba is permitted
+and used under license for Columba. No derivatives or use outside Columba is permitted.
 
 ### Third-party libraries
 
