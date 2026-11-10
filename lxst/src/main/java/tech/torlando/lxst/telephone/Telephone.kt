@@ -380,6 +380,13 @@ class Telephone(
      *
      * @param profile New profile to switch to
      */
+    // IMPORTANT: @Synchronized serializes the whole local switch with
+    // onSignalReceived() (same monitor). Without it, a remote PREFERRED_PROFILE
+    // callback can complete between our transmit and receive steps, and our
+    // stale receive step then overwrites the completed remote switch:
+    // activeProfile and transmit end on the remote profile while receive stays
+    // on ours, so incoming packets fail to decode (Greptile P1 on #26).
+    @Synchronized
     fun switchProfile(profile: Profile) {
         if (activeProfile == profile) {
             Log.d(TAG, "Already using profile ${profile.abbreviation}, ignoring")
@@ -401,6 +408,20 @@ class Telephone(
 
         // Reconfigure transmit pipeline with new codec
         reconfigureTransmitPipeline()
+
+        // Reconfigure the receive pipeline too: the peer reconfigures its RX
+        // when it receives our PREFERRED_PROFILE signal, so a TX-only switch
+        // here leaves our RX decoder pinned to the old codec — the peer's
+        // new-profile packets never decode and we hear silence for the rest
+        // of the call (columba#1238).
+        if (!reconfigureReceivePipeline(profile)) {
+            Log.e(TAG, "Failed to reconfigure native playback for ${profile.abbreviation}; ending call")
+            // Fail closed: the replacement destroyed the previous engine
+            // before configuring its decoder, leaving the call permanently
+            // silent with an unusable native engine.
+            hangup()
+            return
+        }
     }
 
     // ===== Call mode (full/half duplex) negotiation =====
@@ -1012,6 +1033,7 @@ class Telephone(
                     nativeEncoderOpusBitrate = encodeParams.opusBitrate
                     nativeEncoderOpusComplexity = encodeParams.opusComplexity
                     nativeEncoderCodec2Mode = encodeParams.codec2LibraryMode
+                    nativeEncoderFrameDurationMs = activeProfile.frameTimeMs
                 }
             Log.d(TAG, "TX pipeline prepared with native encoder: ${encodeParams.codecType} @ ${encodeParams.sampleRate}Hz")
         }
@@ -1158,6 +1180,7 @@ class Telephone(
             nativeEncoderOpusBitrate = encodeParams.opusBitrate
             nativeEncoderOpusComplexity = encodeParams.opusComplexity
             nativeEncoderCodec2Mode = encodeParams.codec2LibraryMode
+            nativeEncoderFrameDurationMs = activeProfile.frameTimeMs
         }
 
         // Restore mute state (atomic bool persists across configureEncoder)
@@ -1165,6 +1188,86 @@ class Telephone(
 
         // Restart capture — start() configures the new encoder
         audioInput?.start()
+    }
+
+    /**
+     * Reconfigure the receive pipeline (RX decoder, playback ring geometry,
+     * audio output) for [profile]'s decode parameters.
+     *
+     * Both profile-switch paths must call this: the peer reconfigures its RX
+     * when it receives PREFERRED_PROFILE, so a local switch that skips this
+     * leaves the RX decoder pinned to the old codec — incoming packets fail
+     * to decode and the initiator hears silence (columba#1238).
+     *
+     * @return true on success; false if the native playback engine could not
+     *   be recreated. Callers must fail closed: an established call with an
+     *   unusable native engine is permanently silent.
+     */
+    private fun reconfigureReceivePipeline(profile: Profile): Boolean {
+        if (useNativeCodec && useNativePlayback) {
+            // The PCM ring uses fixed frame geometry. Recreate it together with
+            // the decoder when a profile changes sample rate or frame duration.
+            val decodeParams = profile.nativeDecodeParams()
+            val decodedFrameSamples =
+                decodeParams.sampleRate * profile.frameTimeMs / 1000 * decodeParams.channels
+            val playbackReconfigured =
+                linkSource?.reconfigureNativePlayback(profile.frameTimeMs) { prebufferFrames ->
+                    NativePlaybackEngine.withExclusiveAccess {
+                        val engineCreated = NativePlaybackEngine.create(
+                            sampleRate = decodeParams.sampleRate,
+                            channels = decodeParams.channels,
+                            frameSamples = decodedFrameSamples,
+                            maxBufferFrames = OboeLineSink.MAX_QUEUE_SLOTS,
+                            prebufferFrames = prebufferFrames,
+                        )
+                        if (!engineCreated) {
+                            false
+                        } else {
+                            val decoderConfigured = NativePlaybackEngine.configureDecoder(
+                                codecType = decodeParams.codecType,
+                                sampleRate = decodeParams.sampleRate,
+                                channels = decodeParams.channels,
+                                opusApp = decodeParams.opusApplication,
+                                opusBitrate = decodeParams.opusBitrate,
+                                opusComplexity = decodeParams.opusComplexity,
+                                codec2Mode = decodeParams.codec2LibraryMode,
+                            )
+                            if (decoderConfigured) {
+                                // create() replaces the engine and resets native mute.
+                                NativePlaybackEngine.setPlaybackMute(receiveMuted)
+                            }
+                            decoderConfigured
+                        }
+                    }
+                } ?: false
+            if (!playbackReconfigured) return false
+
+            // Reconfigure audio output for new decode rate
+            audioOutput?.let { sink ->
+                if (sink.isRunning()) sink.stop()
+                configureAudioOutput(decodeParams.sampleRate, decodeParams.channels)
+            }
+        } else {
+            // Phase 2: Update Kotlin decoder
+            val decodeCodec = profile.createDecodeCodec()
+            val decodeRate = decodeCodec.preferredSamplerate ?: 48000
+            val decodeChannels = decodeCodec.codecChannels
+            linkSource?.codec = decodeCodec
+            linkSource?.sampleRate = decodeRate
+            linkSource?.channels = decodeChannels
+
+            // The receive mixer caches the channel count from the first frame
+            // it saw; a stereo decode profile must update the cache too, or
+            // stereo frames are paced and played as successive mono samples.
+            receiveMixer?.channels = decodeChannels
+
+            // Reconfigure audio output for new decode rate and channels
+            audioOutput?.let { sink ->
+                if (sink.isRunning()) sink.stop()
+                configureAudioOutput(decodeRate, decodeChannels)
+            }
+        }
+        return true
     }
 
     // ===== Dial Tone / Ring Tone =====
@@ -1404,68 +1507,13 @@ class Telephone(
         activeProfile = profile
         reconfigureTransmitPipeline()
 
-        if (useNativeCodec && useNativePlayback) {
-            // The PCM ring uses fixed frame geometry. Recreate it together with
-            // the decoder when a profile changes sample rate or frame duration.
-            val decodeParams = profile.nativeDecodeParams()
-            val decodedFrameSamples =
-                decodeParams.sampleRate * profile.frameTimeMs / 1000 * decodeParams.channels
-            val playbackReconfigured =
-                linkSource?.reconfigureNativePlayback(profile.frameTimeMs) { prebufferFrames ->
-                    NativePlaybackEngine.withExclusiveAccess {
-                        val engineCreated = NativePlaybackEngine.create(
-                            sampleRate = decodeParams.sampleRate,
-                            channels = decodeParams.channels,
-                            frameSamples = decodedFrameSamples,
-                            maxBufferFrames = OboeLineSink.MAX_QUEUE_SLOTS,
-                            prebufferFrames = prebufferFrames,
-                        )
-                        if (!engineCreated) {
-                            false
-                        } else {
-                            val decoderConfigured = NativePlaybackEngine.configureDecoder(
-                                codecType = decodeParams.codecType,
-                                sampleRate = decodeParams.sampleRate,
-                                channels = decodeParams.channels,
-                                opusApp = decodeParams.opusApplication,
-                                opusBitrate = decodeParams.opusBitrate,
-                                opusComplexity = decodeParams.opusComplexity,
-                                codec2Mode = decodeParams.codec2LibraryMode,
-                            )
-                            if (decoderConfigured) {
-                                // create() replaces the engine and resets native mute.
-                                NativePlaybackEngine.setPlaybackMute(receiveMuted)
-                            }
-                            decoderConfigured
-                        }
-                    }
-                } ?: false
-            if (!playbackReconfigured) {
-                Log.e(TAG, "Failed to reconfigure native playback for ${profile.abbreviation}; ending call")
-                // Replacement destroys the previous engine before configuring
-                // its decoder. Fail closed instead of leaving an established
-                // call permanently silent with an unusable native engine.
-                hangup()
-                return
-            }
-
-            // Reconfigure audio output for new decode rate
-            audioOutput?.let { sink ->
-                if (sink.isRunning()) sink.stop()
-                configureAudioOutput(decodeParams.sampleRate, decodeParams.channels)
-            }
-        } else {
-            // Phase 2: Update Kotlin decoder
-            val decodeCodec = profile.createDecodeCodec()
-            val decodeRate = decodeCodec.preferredSamplerate ?: 48000
-            linkSource?.codec = decodeCodec
-            linkSource?.sampleRate = decodeRate
-
-            // Reconfigure audio output for new decode rate
-            audioOutput?.let { sink ->
-                if (sink.isRunning()) sink.stop()
-                configureAudioOutput(decodeRate, 1)
-            }
+        if (!reconfigureReceivePipeline(profile)) {
+            Log.e(TAG, "Failed to reconfigure native playback for ${profile.abbreviation}; ending call")
+            // Replacement destroys the previous engine before configuring
+            // its decoder. Fail closed instead of leaving an established
+            // call permanently silent with an unusable native engine.
+            hangup()
+            return
         }
     }
 

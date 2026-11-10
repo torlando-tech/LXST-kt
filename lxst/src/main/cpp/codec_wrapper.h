@@ -113,6 +113,7 @@ public:
     CodecType type() const { return type_; }
     int channels() const { return channels_; }
     int sampleRate() const { return sampleRate_; }
+    int codec2SamplesPerFrame() const { return c2SamplesPerFrame_; }
 
 private:
     CodecType type_ = CodecType::NONE;

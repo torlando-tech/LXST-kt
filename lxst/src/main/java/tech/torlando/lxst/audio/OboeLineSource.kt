@@ -84,6 +84,7 @@ class OboeLineSource(
     var nativeEncoderOpusBitrate: Int = 0
     var nativeEncoderOpusComplexity: Int = 10
     var nativeEncoderCodec2Mode: Int = 0
+    var nativeEncoderFrameDurationMs: Int = 0
 
     // Audio configuration (derived from codec, same as LineSource)
     override var sampleRate: Int = DEFAULT_SAMPLE_RATE
@@ -136,7 +137,12 @@ class OboeLineSource(
                 val created =
                     NativeCaptureEngine.create(
                         sampleRate = sampleRate,
-                        channels = channels,
+                        // Native codec mode captures MONO regardless of the
+                        // codec's channel count: CodecWrapper::encode() upmixes
+                        // to stereo for stereo profiles (SHQ). Opening a 2ch
+                        // stream here would feed interleaved samples into that
+                        // mono-sized accumulator and double-upmix (2x pitch).
+                        channels = if (useNativeCodec) 1 else channels,
                         frameSamples = samplesPerFrame,
                         maxBufferFrames = effectiveMaxFrames.coerceAtMost(MAX_QUEUE_SLOTS),
                         enableFilters = true,
@@ -161,6 +167,7 @@ class OboeLineSource(
                     opusBitrate = nativeEncoderOpusBitrate,
                     opusComplexity = nativeEncoderOpusComplexity,
                     codec2Mode = nativeEncoderCodec2Mode,
+                    frameDurationMs = nativeEncoderFrameDurationMs,
                 )
             Log.i(TAG, "Native encoder configured: $configured (type=$nativeEncoderCodecType rate=$nativeEncoderSampleRate)")
         }

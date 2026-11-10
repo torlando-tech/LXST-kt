@@ -717,13 +717,186 @@ class NativeCodecInstrumentedTest {
             opusBitrate = llParams.opusBitrate,
             opusComplexity = llParams.opusComplexity,
             codec2Mode = llParams.codec2LibraryMode,
+            frameDurationMs = Profile.LL.frameTimeMs,
         )
 
         Thread.sleep(1500)
 
         var llPackets = 0
-        while (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) llPackets++
+        var firstLlDecoded = -1
+        while (true) {
+            val len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len <= 0) break
+            llPackets++
+            if (llPackets == 1) {
+                // LL frames are 20ms; decoded at the VOICE_HIGH 48kHz decode
+                // rate that is exactly 960 samples — the RX ring frame size.
+                val llDecode = trackCodec(Profile.LL.createDecodeCodec())
+                firstLlDecoded = llDecode.decode(encodedBuf.copyOf(len)).size
+            }
+        }
         assertTrue("LL phase should produce >=5 packets (got $llPackets)", llPackets >= 5)
+        assertEquals("LL packets must carry the 20ms profile frame", 960, firstLlDecoded)
+    }
+
+    @Test
+    fun nativeEncoder_reconfig_mqToVlbw_emitsFullProfileFramePackets() {
+        // Regression for columba#1238: after a mid-call MQ→VLBW switch the
+        // native TX must emit ONE PACKET PER VLBW PROFILE FRAME (320ms =
+        // 8 codec2 quanta = 64 bytes + mode header = 65 bytes). The old
+        // formula derived the packet length from the capture frame duration
+        // of the profile that was active when the engine was CREATED (MQ:
+        // 60ms), so it emitted 40ms quanta into the 320ms RX ring — the ring
+        // never filled and both directions went silent.
+        val mqParams = Profile.MQ.nativeEncodeParams()
+        val created =
+            NativeCaptureEngine.create(
+                sampleRate = mqParams.sampleRate,
+                channels = mqParams.channels,
+                frameSamples = mqParams.sampleRate * Profile.MQ.frameTimeMs / 1000,
+                maxBufferFrames = 75,
+                enableFilters = true,
+            )
+        assertTrue("Capture engine should create", created)
+
+        NativeCaptureEngine.configureEncoder(
+            codecType = mqParams.codecType,
+            sampleRate = mqParams.sampleRate,
+            channels = mqParams.channels,
+            opusApp = mqParams.opusApplication,
+            opusBitrate = mqParams.opusBitrate,
+            opusComplexity = mqParams.opusComplexity,
+            codec2Mode = mqParams.codec2LibraryMode,
+        )
+        assertTrue("Capture stream should start", NativeCaptureEngine.startStream())
+        Thread.sleep(500)
+
+        // Drain MQ-era packets.
+        val encodedBuf = ByteArray(1500)
+        while (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) {}
+
+        // Switch to VLBW (codec2 1600 @8k, 320ms profile frame) exactly as
+        // Telephone.reconfigureTransmitNativeCodec does: stop the stream,
+        // destroy the encoder, reconfigure, restart (openStream re-rates the
+        // capture→encoder resampler for the new encoder rate).
+        NativeCaptureEngine.stopStream()
+        NativeCaptureEngine.destroyEncoder()
+        val vlbwParams = Profile.VLBW.nativeEncodeParams()
+        assertTrue(
+            "VLBW encoder should configure",
+            NativeCaptureEngine.configureEncoder(
+                codecType = vlbwParams.codecType,
+                sampleRate = vlbwParams.sampleRate,
+                channels = vlbwParams.channels,
+                codec2Mode = vlbwParams.codec2LibraryMode,
+                frameDurationMs = Profile.VLBW.frameTimeMs,
+            ),
+        )
+        assertTrue("Capture stream should restart", NativeCaptureEngine.startStream())
+
+        // Wait for the first VLBW packet (320ms frame period + capture latency).
+        var len = 0
+        val deadline = System.currentTimeMillis() + 5000
+        while (len <= 0 && System.currentTimeMillis() < deadline) {
+            len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len <= 0) Thread.sleep(20)
+        }
+        NativeCaptureEngine.stopStream()
+        assertTrue("VLBW encoder must produce packets", len > 0)
+
+        // Full profile frame: 8 quanta × 8 bytes + 1 mode header = 65 bytes.
+        assertEquals("VLBW packet must carry the full 320ms profile frame", 65, len)
+
+        // And it must decode to exactly one RX ring frame (320ms @8k = 2560).
+        val vlbwDecode = trackCodec(Profile.VLBW.createDecodeCodec())
+        val decoded = vlbwDecode.decode(encodedBuf.copyOf(len))
+        assertEquals("VLBW packet must decode to the RX ring frame size", 2560, decoded.size)
+    }
+
+    @Test
+    fun nativeEncoder_reconfig_mqToShq_emitsSixtyMsStereoFrames() {
+        // SHQ is the only stereo profile (Opus VOICE_MAX, 48kHz 2ch). Capture
+        // stays MONO and CodecWrapper upmixes, so a mid-call MQ→SHQ switch must
+        // emit 60ms STEREO frames = 5760 decoded samples. Sizing the encoder
+        // chunk by encoder channels (5760 mono samples = 120ms) skipped the
+        // upmix and produced 2x-pitched "stereo" — Tyler's on-device report
+        // and Greptile P1 on #26.
+        val mqParams = Profile.MQ.nativeEncodeParams()
+        val created =
+            NativeCaptureEngine.create(
+                sampleRate = mqParams.sampleRate,
+                channels = 1,
+                frameSamples = mqParams.sampleRate * Profile.MQ.frameTimeMs / 1000,
+                maxBufferFrames = 75,
+                enableFilters = true,
+            )
+        assertTrue("Capture engine should create", created)
+
+        NativeCaptureEngine.configureEncoder(
+            codecType = mqParams.codecType,
+            sampleRate = mqParams.sampleRate,
+            channels = mqParams.channels,
+            opusApp = mqParams.opusApplication,
+            opusBitrate = mqParams.opusBitrate,
+            opusComplexity = mqParams.opusComplexity,
+            codec2Mode = mqParams.codec2LibraryMode,
+            frameDurationMs = Profile.MQ.frameTimeMs,
+        )
+        assertTrue("Capture stream should start", NativeCaptureEngine.startStream())
+        Thread.sleep(500)
+
+        val encodedBuf = ByteArray(1500)
+        while (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) {}
+
+        NativeCaptureEngine.stopStream()
+        NativeCaptureEngine.destroyEncoder()
+        val shqParams = Profile.SHQ.nativeEncodeParams()
+        assertEquals("SHQ must be the stereo profile", 2, shqParams.channels)
+        assertTrue(
+            "SHQ encoder should configure",
+            NativeCaptureEngine.configureEncoder(
+                codecType = shqParams.codecType,
+                sampleRate = shqParams.sampleRate,
+                channels = shqParams.channels,
+                opusApp = shqParams.opusApplication,
+                opusBitrate = shqParams.opusBitrate,
+                opusComplexity = shqParams.opusComplexity,
+                codec2Mode = shqParams.codec2LibraryMode,
+                frameDurationMs = Profile.SHQ.frameTimeMs,
+            ),
+        )
+        assertTrue("Capture stream should restart", NativeCaptureEngine.startStream())
+
+        var len = 0
+        val deadline = System.currentTimeMillis() + 5000
+        while (len <= 0 && System.currentTimeMillis() < deadline) {
+            len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len <= 0) Thread.sleep(20)
+        }
+        assertTrue("SHQ encoder must produce packets", len > 0)
+        // Frame geometry: 60ms stereo at 48kHz = 5760 interleaved samples.
+        val shqDecode = trackCodec(Profile.SHQ.createDecodeCodec())
+        val decoded = shqDecode.decode(encodedBuf.copyOf(len))
+        assertEquals("SHQ packet must carry one 60ms stereo frame", 5760, decoded.size)
+
+        // Packet RATE is the discriminator: sized in mono samples the encoder
+        // emits one packet per 60ms. Sized by encoder channels (5760 mono =
+        // 120ms) the packet still decodes to 5760 but arrives at half rate,
+        // built from 120ms of audio — the 2x-pitch field symptom. Five
+        // consecutive packets must span ~240ms; the bug needs ~480ms.
+        var seen = 0
+        val paceStart = System.currentTimeMillis()
+        val paceDeadline = paceStart + 2000
+        while (seen < 4 && System.currentTimeMillis() < paceDeadline) {
+            if (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) seen++ else Thread.sleep(5)
+        }
+        val pace = System.currentTimeMillis() - paceStart
+        NativeCaptureEngine.stopStream()
+        assertTrue(
+            "SHQ must emit a 60ms packet every ~60ms; 4 packets took ${pace}ms " +
+                "(>=360ms means 120ms mono chunks - the 2x-pitch bug)",
+            pace < 360,
+        )
     }
 
     // =====================================================================
@@ -1054,7 +1227,9 @@ class NativeCodecInstrumentedTest {
     fun nativeDecoder_prebuffer_preventsExcessiveSilence() {
         sinePhase = 0.0
         val decFrameSamples = 48000 * 60 / 1000 // 2880 (HQ: 60ms at 48kHz)
-        val framesToLoad = 15 // 900ms of audio pre-loaded
+        // Stay under the adaptive-drain ceiling (2x prebuffer = 10 frames,
+        // f6e5bcb bounds burst latency): 9 frames = 540ms pre-loaded.
+        val framesToLoad = 9
 
         val created =
             NativePlaybackEngine.create(
@@ -1098,10 +1273,10 @@ class NativeCodecInstrumentedTest {
         val started = NativePlaybackEngine.startStream()
         assertTrue("Oboe stream should start", started)
 
-        // Wait for ~60% of audio to play (540ms of 900ms), then check.
-        // All data was pre-loaded, so the callback should have zero silence
-        // during this window.
-        Thread.sleep(540)
+        // Wait for most of the pre-loaded audio to play (480ms of 540ms),
+        // then check. All data was pre-loaded and below the adaptive-drain
+        // ceiling, so the callback should have zero silence in this window.
+        Thread.sleep(480)
 
         val cbFrames = NativePlaybackEngine.getCallbackFrameCount()
         val cbSilence = NativePlaybackEngine.getCallbackSilenceCount()
@@ -1127,6 +1302,73 @@ class NativeCodecInstrumentedTest {
         Thread.sleep(600)
 
         NativePlaybackEngine.destroyDecoder()
+    }
+
+    /**
+     * Adaptive playout drain (f6e5bcb): a burst larger than 2x prebuffer is
+     * trimmed to the prebuffer level on the first callback so Reticulum
+     * bursts cannot ratchet playback latency up. Pre-load 15 frames with
+     * prebuffer=5: without the drain the buffer would still hold ~13 frames
+     * 100ms after start; with it, buffered must sit at or below the 10-frame
+     * ceiling.
+     */
+    @Test
+    fun nativeDecoder_burstPreload_adaptiveDrainBoundsLatency() {
+        sinePhase = 0.0
+        val decFrameSamples = 48000 * 60 / 1000
+
+        val created =
+            NativePlaybackEngine.create(
+                sampleRate = 48000,
+                channels = 1,
+                frameSamples = decFrameSamples,
+                maxBufferFrames = 75,
+                prebufferFrames = PREBUFFER_FRAMES,
+            )
+        assertTrue("Playback engine should create", created)
+        playbackEngineCreated = true
+
+        val hqDecParams = Profile.HQ.nativeDecodeParams()
+        assertTrue(
+            "HQ decoder should configure",
+            NativePlaybackEngine.configureDecoder(
+                codecType = hqDecParams.codecType,
+                sampleRate = hqDecParams.sampleRate,
+                channels = hqDecParams.channels,
+                opusApp = hqDecParams.opusApplication,
+                opusBitrate = hqDecParams.opusBitrate,
+                opusComplexity = hqDecParams.opusComplexity,
+                codec2Mode = hqDecParams.codec2LibraryMode,
+            ),
+        )
+
+        // 15-frame burst = 3x the prebuffer, 1.5x the drain ceiling.
+        val enc = trackCodec(Profile.HQ.createCodec())
+        repeat(15) {
+            val pcm = generateSineFrame(48000, 1, 60)
+            val encoded = enc.encode(pcm)
+            NativePlaybackEngine.writeEncodedPacket(encoded, 0, encoded.size)
+        }
+        // The burst must actually be in the ring before the drain can trim
+        // it - otherwise an empty buffer would satisfy the <=10 assertion.
+        val preStartBuf = NativePlaybackEngine.getBufferedFrameCount()
+        assertTrue("Burst should buffer 15 frames, got $preStartBuf", preStartBuf >= 14)
+        assertTrue("Oboe stream should start", NativePlaybackEngine.startStream())
+
+        // Give the callback a couple of bursts to run the drain, then sample
+        // the level. Consumption in 100ms is at most ~2 frames, so a buffer
+        // that was never drained cannot fall below 13.
+        Thread.sleep(100)
+        val buffered = NativePlaybackEngine.getBufferedFrameCount()
+        NativePlaybackEngine.stopStream()
+        NativePlaybackEngine.destroyDecoder()
+        assertTrue(
+            "Burst of 15 frames (prebuffer=5, ceiling=10) must be trimmed to " +
+                "1..10 frames by the adaptive drain; buffered=$buffered. " +
+                ">10 means the latency bound regressed; 0 means no audio was " +
+                "ever buffered and the test proved nothing.",
+            buffered in 1..10,
+        )
     }
 
     // =====================================================================
@@ -1341,18 +1583,21 @@ class NativeCodecInstrumentedTest {
      */
     @Test
     fun computePrebufferFrames_timeBased_allProfiles() {
-        // Standard profiles (60ms): 300/60 = 5, max(5,5) = 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.MQ.frameTimeMs))
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.HQ.frameTimeMs))
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.SHQ.frameTimeMs))
+        // PREBUFFER_TARGET_MS is 450 (raised from 300 by 33681be for Opus PLC
+        // jitter headroom). Standard profiles (60ms): 450/60 = 7.
+        assertEquals(7, LinkSource.computePrebufferFrames(Profile.MQ.frameTimeMs))
+        assertEquals(7, LinkSource.computePrebufferFrames(Profile.HQ.frameTimeMs))
+        assertEquals(7, LinkSource.computePrebufferFrames(Profile.SHQ.frameTimeMs))
 
         // Low-latency profiles
-        assertEquals(15, LinkSource.computePrebufferFrames(Profile.LL.frameTimeMs)) // 300/20 = 15
-        assertEquals(30, LinkSource.computePrebufferFrames(Profile.ULL.frameTimeMs)) // 300/10 = 30
+        assertEquals(22, LinkSource.computePrebufferFrames(Profile.LL.frameTimeMs)) // 450/20
+        assertEquals(45, LinkSource.computePrebufferFrames(Profile.ULL.frameTimeMs)) // 450/10
 
-        // Codec2 profiles (long frames): floor clamps to 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.ULBW.frameTimeMs)) // 300/400 = 0 → 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.VLBW.frameTimeMs)) // 300/320 = 0 → 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.LBW.frameTimeMs)) // 300/200 = 1 → 5
+        // Codec2 long-frame profiles: one packet already buffers 400/320/200ms,
+        // so Codec2PlaybackPolicy starts playback after a single packet
+        // (Python LXST parity) - the 5-frame floor does not apply.
+        assertEquals(1, LinkSource.computePrebufferFrames(Profile.ULBW.frameTimeMs))
+        assertEquals(1, LinkSource.computePrebufferFrames(Profile.VLBW.frameTimeMs))
+        assertEquals(1, LinkSource.computePrebufferFrames(Profile.LBW.frameTimeMs))
     }
 }

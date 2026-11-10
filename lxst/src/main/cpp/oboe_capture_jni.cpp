@@ -153,7 +153,8 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeConfigureEncoder(
         jint opusApp,
         jint opusBitrate,
         jint opusComplexity,
-        jint codec2Mode) {
+        jint codec2Mode,
+        jint frameDurationMs) {
 
     std::lock_guard<std::mutex> lock(sCaptureEngineMutex);
     if (!sCaptureEngine) {
@@ -164,7 +165,7 @@ Java_tech_torlando_lxst_audio_NativeCaptureEngine_nativeConfigureEncoder(
     return static_cast<jboolean>(
         sCaptureEngine->configureEncoder(codecType, sampleRate, channels,
                                          opusApp, opusBitrate, opusComplexity,
-                                         codec2Mode));
+                                         codec2Mode, frameDurationMs));
 }
 
 JNIEXPORT jint JNICALL
