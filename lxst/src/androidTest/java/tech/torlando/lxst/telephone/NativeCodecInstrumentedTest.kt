@@ -1329,14 +1329,17 @@ class NativeCodecInstrumentedTest {
         playbackEngineCreated = true
 
         val hqDecParams = Profile.HQ.nativeDecodeParams()
-        NativePlaybackEngine.configureDecoder(
-            codecType = hqDecParams.codecType,
-            sampleRate = hqDecParams.sampleRate,
-            channels = hqDecParams.channels,
-            opusApp = hqDecParams.opusApplication,
-            opusBitrate = hqDecParams.opusBitrate,
-            opusComplexity = hqDecParams.opusComplexity,
-            codec2Mode = hqDecParams.codec2LibraryMode,
+        assertTrue(
+            "HQ decoder should configure",
+            NativePlaybackEngine.configureDecoder(
+                codecType = hqDecParams.codecType,
+                sampleRate = hqDecParams.sampleRate,
+                channels = hqDecParams.channels,
+                opusApp = hqDecParams.opusApplication,
+                opusBitrate = hqDecParams.opusBitrate,
+                opusComplexity = hqDecParams.opusComplexity,
+                codec2Mode = hqDecParams.codec2LibraryMode,
+            ),
         )
 
         // 15-frame burst = 3x the prebuffer, 1.5x the drain ceiling.
@@ -1346,6 +1349,10 @@ class NativeCodecInstrumentedTest {
             val encoded = enc.encode(pcm)
             NativePlaybackEngine.writeEncodedPacket(encoded, 0, encoded.size)
         }
+        // The burst must actually be in the ring before the drain can trim
+        // it - otherwise an empty buffer would satisfy the <=10 assertion.
+        val preStartBuf = NativePlaybackEngine.getBufferedFrameCount()
+        assertTrue("Burst should buffer 15 frames, got $preStartBuf", preStartBuf >= 14)
         assertTrue("Oboe stream should start", NativePlaybackEngine.startStream())
 
         // Give the callback a couple of bursts to run the drain, then sample
@@ -1357,9 +1364,10 @@ class NativeCodecInstrumentedTest {
         NativePlaybackEngine.destroyDecoder()
         assertTrue(
             "Burst of 15 frames (prebuffer=5, ceiling=10) must be trimmed to " +
-                "<=10 frames by the adaptive drain; buffered=$buffered. " +
-                ">10 means the latency bound regressed.",
-            buffered <= 10,
+                "1..10 frames by the adaptive drain; buffered=$buffered. " +
+                ">10 means the latency bound regressed; 0 means no audio was " +
+                "ever buffered and the test proved nothing.",
+            buffered in 1..10,
         )
     }
 
