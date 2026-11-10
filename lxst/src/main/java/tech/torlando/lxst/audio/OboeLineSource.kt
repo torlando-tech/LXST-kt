@@ -137,7 +137,12 @@ class OboeLineSource(
                 val created =
                     NativeCaptureEngine.create(
                         sampleRate = sampleRate,
-                        channels = channels,
+                        // Native codec mode captures MONO regardless of the
+                        // codec's channel count: CodecWrapper::encode() upmixes
+                        // to stereo for stereo profiles (SHQ). Opening a 2ch
+                        // stream here would feed interleaved samples into that
+                        // mono-sized accumulator and double-upmix (2x pitch).
+                        channels = if (useNativeCodec) 1 else channels,
                         frameSamples = samplesPerFrame,
                         maxBufferFrames = effectiveMaxFrames.coerceAtMost(MAX_QUEUE_SLOTS),
                         enableFilters = true,

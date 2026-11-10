@@ -813,6 +813,92 @@ class NativeCodecInstrumentedTest {
         assertEquals("VLBW packet must decode to the RX ring frame size", 2560, decoded.size)
     }
 
+    @Test
+    fun nativeEncoder_reconfig_mqToShq_emitsSixtyMsStereoFrames() {
+        // SHQ is the only stereo profile (Opus VOICE_MAX, 48kHz 2ch). Capture
+        // stays MONO and CodecWrapper upmixes, so a mid-call MQ→SHQ switch must
+        // emit 60ms STEREO frames = 5760 decoded samples. Sizing the encoder
+        // chunk by encoder channels (5760 mono samples = 120ms) skipped the
+        // upmix and produced 2x-pitched "stereo" — Tyler's on-device report
+        // and Greptile P1 on #26.
+        val mqParams = Profile.MQ.nativeEncodeParams()
+        val created =
+            NativeCaptureEngine.create(
+                sampleRate = mqParams.sampleRate,
+                channels = 1,
+                frameSamples = mqParams.sampleRate * Profile.MQ.frameTimeMs / 1000,
+                maxBufferFrames = 75,
+                enableFilters = true,
+            )
+        assertTrue("Capture engine should create", created)
+
+        NativeCaptureEngine.configureEncoder(
+            codecType = mqParams.codecType,
+            sampleRate = mqParams.sampleRate,
+            channels = mqParams.channels,
+            opusApp = mqParams.opusApplication,
+            opusBitrate = mqParams.opusBitrate,
+            opusComplexity = mqParams.opusComplexity,
+            codec2Mode = mqParams.codec2LibraryMode,
+            frameDurationMs = Profile.MQ.frameTimeMs,
+        )
+        assertTrue("Capture stream should start", NativeCaptureEngine.startStream())
+        Thread.sleep(500)
+
+        val encodedBuf = ByteArray(1500)
+        while (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) {}
+
+        NativeCaptureEngine.stopStream()
+        NativeCaptureEngine.destroyEncoder()
+        val shqParams = Profile.SHQ.nativeEncodeParams()
+        assertEquals("SHQ must be the stereo profile", 2, shqParams.channels)
+        assertTrue(
+            "SHQ encoder should configure",
+            NativeCaptureEngine.configureEncoder(
+                codecType = shqParams.codecType,
+                sampleRate = shqParams.sampleRate,
+                channels = shqParams.channels,
+                opusApp = shqParams.opusApplication,
+                opusBitrate = shqParams.opusBitrate,
+                opusComplexity = shqParams.opusComplexity,
+                codec2Mode = shqParams.codec2LibraryMode,
+                frameDurationMs = Profile.SHQ.frameTimeMs,
+            ),
+        )
+        assertTrue("Capture stream should restart", NativeCaptureEngine.startStream())
+
+        var len = 0
+        val deadline = System.currentTimeMillis() + 5000
+        while (len <= 0 && System.currentTimeMillis() < deadline) {
+            len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len <= 0) Thread.sleep(20)
+        }
+        assertTrue("SHQ encoder must produce packets", len > 0)
+        // Frame geometry: 60ms stereo at 48kHz = 5760 interleaved samples.
+        val shqDecode = trackCodec(Profile.SHQ.createDecodeCodec())
+        val decoded = shqDecode.decode(encodedBuf.copyOf(len))
+        assertEquals("SHQ packet must carry one 60ms stereo frame", 5760, decoded.size)
+
+        // Packet RATE is the discriminator: sized in mono samples the encoder
+        // emits one packet per 60ms. Sized by encoder channels (5760 mono =
+        // 120ms) the packet still decodes to 5760 but arrives at half rate,
+        // built from 120ms of audio — the 2x-pitch field symptom. Five
+        // consecutive packets must span ~240ms; the bug needs ~480ms.
+        var seen = 0
+        val paceStart = System.currentTimeMillis()
+        val paceDeadline = paceStart + 2000
+        while (seen < 4 && System.currentTimeMillis() < paceDeadline) {
+            if (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) seen++ else Thread.sleep(5)
+        }
+        val pace = System.currentTimeMillis() - paceStart
+        NativeCaptureEngine.stopStream()
+        assertTrue(
+            "SHQ must emit a 60ms packet every ~60ms; 4 packets took ${pace}ms " +
+                "(>=360ms means 120ms mono chunks - the 2x-pitch bug)",
+            pace < 360,
+        )
+    }
+
     // =====================================================================
     //  LIFECYCLE: configureEncoder must be called after create()
     // =====================================================================
@@ -1428,18 +1514,21 @@ class NativeCodecInstrumentedTest {
      */
     @Test
     fun computePrebufferFrames_timeBased_allProfiles() {
-        // Standard profiles (60ms): 300/60 = 5, max(5,5) = 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.MQ.frameTimeMs))
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.HQ.frameTimeMs))
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.SHQ.frameTimeMs))
+        // PREBUFFER_TARGET_MS is 450 (raised from 300 by 33681be for Opus PLC
+        // jitter headroom). Standard profiles (60ms): 450/60 = 7.
+        assertEquals(7, LinkSource.computePrebufferFrames(Profile.MQ.frameTimeMs))
+        assertEquals(7, LinkSource.computePrebufferFrames(Profile.HQ.frameTimeMs))
+        assertEquals(7, LinkSource.computePrebufferFrames(Profile.SHQ.frameTimeMs))
 
         // Low-latency profiles
-        assertEquals(15, LinkSource.computePrebufferFrames(Profile.LL.frameTimeMs)) // 300/20 = 15
-        assertEquals(30, LinkSource.computePrebufferFrames(Profile.ULL.frameTimeMs)) // 300/10 = 30
+        assertEquals(22, LinkSource.computePrebufferFrames(Profile.LL.frameTimeMs)) // 450/20
+        assertEquals(45, LinkSource.computePrebufferFrames(Profile.ULL.frameTimeMs)) // 450/10
 
-        // Codec2 profiles (long frames): floor clamps to 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.ULBW.frameTimeMs)) // 300/400 = 0 → 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.VLBW.frameTimeMs)) // 300/320 = 0 → 5
-        assertEquals(5, LinkSource.computePrebufferFrames(Profile.LBW.frameTimeMs)) // 300/200 = 1 → 5
+        // Codec2 long-frame profiles: one packet already buffers 400/320/200ms,
+        // so Codec2PlaybackPolicy starts playback after a single packet
+        // (Python LXST parity) - the 5-frame floor does not apply.
+        assertEquals(1, LinkSource.computePrebufferFrames(Profile.ULBW.frameTimeMs))
+        assertEquals(1, LinkSource.computePrebufferFrames(Profile.VLBW.frameTimeMs))
+        assertEquals(1, LinkSource.computePrebufferFrames(Profile.LBW.frameTimeMs))
     }
 }

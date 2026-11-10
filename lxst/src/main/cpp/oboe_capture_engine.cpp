@@ -403,10 +403,16 @@ bool OboeCaptureEngine::configureEncoder(int codecType, int sampleRate, int chan
     // that was active when the engine was CREATED: a mid-call profile switch
     // then emits stale-length chunks (MQ→VLBW sent 40ms codec2 quanta into a
     // 320ms RX ring that never filled — columba#1238).
+    //
+    // Sized in MONO samples — capture is always mono in native-codec mode and
+    // CodecWrapper::encode() upmixes to the encoder's channel count. Including
+    // the encoder channels here would double the wait for stereo profiles
+    // (SHQ: 5760 = 120ms of mono), skip that upmix (pcmSamples > 2880) and
+    // emit 60ms "stereo" built from 120ms of audio — pitch-shifted up 2x.
     int frameSize;
     if (frameDurationMs > 0) {
         frameSize = static_cast<int>(
-            sampleRate * channels * (frameDurationMs / 1000.0) + 0.5);
+            sampleRate * (frameDurationMs / 1000.0) + 0.5);
         if (codecType == static_cast<int>(CodecType::CODEC2)) {
             // Codec2 only accepts whole 40ms quanta. Round the profile frame
             // to the nearest quantum count (all profile frame times are exact
