@@ -380,6 +380,13 @@ class Telephone(
      *
      * @param profile New profile to switch to
      */
+    // IMPORTANT: @Synchronized serializes the whole local switch with
+    // onSignalReceived() (same monitor). Without it, a remote PREFERRED_PROFILE
+    // callback can complete between our transmit and receive steps, and our
+    // stale receive step then overwrites the completed remote switch:
+    // activeProfile and transmit end on the remote profile while receive stays
+    // on ours, so incoming packets fail to decode (Greptile P1 on #26).
+    @Synchronized
     fun switchProfile(profile: Profile) {
         if (activeProfile == profile) {
             Log.d(TAG, "Already using profile ${profile.abbreviation}, ignoring")
@@ -1242,13 +1249,20 @@ class Telephone(
             // Phase 2: Update Kotlin decoder
             val decodeCodec = profile.createDecodeCodec()
             val decodeRate = decodeCodec.preferredSamplerate ?: 48000
+            val decodeChannels = decodeCodec.codecChannels
             linkSource?.codec = decodeCodec
             linkSource?.sampleRate = decodeRate
+            linkSource?.channels = decodeChannels
 
-            // Reconfigure audio output for new decode rate
+            // The receive mixer caches the channel count from the first frame
+            // it saw; a stereo decode profile must update the cache too, or
+            // stereo frames are paced and played as successive mono samples.
+            receiveMixer?.channels = decodeChannels
+
+            // Reconfigure audio output for new decode rate and channels
             audioOutput?.let { sink ->
                 if (sink.isRunning()) sink.stop()
-                configureAudioOutput(decodeRate, 1)
+                configureAudioOutput(decodeRate, decodeChannels)
             }
         }
         return true

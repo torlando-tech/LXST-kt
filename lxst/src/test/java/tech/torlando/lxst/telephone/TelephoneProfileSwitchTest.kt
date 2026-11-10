@@ -18,9 +18,15 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import tech.torlando.lxst.audio.LinkSource
+import tech.torlando.lxst.audio.Mixer
+import tech.torlando.lxst.audio.OboeLineSink
 import tech.torlando.lxst.audio.Signalling
 import tech.torlando.lxst.core.AudioDevice
 import tech.torlando.lxst.core.CallCoordinator
@@ -106,12 +112,39 @@ class TelephoneProfileSwitchTest {
         return field.get(telephone) as LinkSource
     }
 
+    /** The Telephone's private receive mixer (caches the playback channel count). */
+    private fun receiveMixer(): Mixer {
+        val field = Telephone::class.java.getDeclaredField("receiveMixer")
+        field.isAccessible = true
+        return field.get(telephone) as Mixer
+    }
+
+    /** The channel count configured on the audio output sink. */
+    private fun outputSinkChannels(): Int {
+        val sinkField = Telephone::class.java.getDeclaredField("audioOutput")
+        sinkField.isAccessible = true
+        val sink = requireNotNull(sinkField.get(telephone)) { "audioOutput must exist once established" }
+        val chField = OboeLineSink::class.java.getDeclaredField("channels")
+        chField.isAccessible = true
+        return chField.getInt(sink)
+    }
+
+    /** Everything downstream of the RX decoder must match a stereo SHQ decode. */
+    private fun assertStereoReceive(tag: String) {
+        assertEquals("$tag: linkSource codec channels", 2, receiveLinkSource().codec.codecChannels)
+        assertEquals("$tag: linkSource channels", 2, receiveLinkSource().channels)
+        assertEquals("$tag: linkSource sampleRate", 48000, receiveLinkSource().sampleRate)
+        assertEquals("$tag: mixer cached channels", 2, receiveMixer().channels)
+        assertEquals("$tag: audio output channels", 2, outputSinkChannels())
+    }
+
     @Test
     fun `established call decodes with the active profile decode codec`() =
         runTest {
             establishCall()
             // Default profile MQ decodes as Opus VOICE_HIGH: mono at 48 kHz.
             assertEquals(1, receiveLinkSource().codec.codecChannels)
+            assertEquals(1, receiveLinkSource().channels)
             assertEquals(48000, receiveLinkSource().sampleRate)
         }
 
@@ -121,15 +154,16 @@ class TelephoneProfileSwitchTest {
             establishCall()
 
             // SHQ decodes as Opus VOICE_MAX: stereo at 48 kHz. The RX decoder
-            // must follow the profile, exactly as switchProfileFromRemote does —
-            // otherwise the peer's new-codec packets never decode and the
-            // initiator hears silence (columba#1238).
+            // and everything downstream of it (link source channel count,
+            // mixer's cached channel count, audio output) must follow the
+            // profile, exactly as switchProfileFromRemote does — otherwise the
+            // peer's new-codec packets never decode or stereo frames play as
+            // garbled mono (columba#1238).
             telephone.switchProfile(Profile.SHQ)
             testDispatcher.scheduler.advanceUntilIdle()
 
             assertEquals(Profile.SHQ, telephone.activeProfile)
-            assertEquals(2, receiveLinkSource().codec.codecChannels)
-            assertEquals(48000, receiveLinkSource().sampleRate)
+            assertStereoReceive("local switchProfile")
         }
 
     @Test
@@ -141,7 +175,76 @@ class TelephoneProfileSwitchTest {
             testDispatcher.scheduler.advanceUntilIdle()
 
             assertEquals(Profile.SHQ, telephone.activeProfile)
-            assertEquals(2, receiveLinkSource().codec.codecChannels)
-            assertEquals(48000, receiveLinkSource().sampleRate)
+            assertStereoReceive("remote PREFERRED_PROFILE")
+        }
+
+    @Test
+    fun `overlapping local and remote switches leave receive on the final profile`() =
+        runTest {
+            establishCall()
+
+            // Both profiles must be JVM-constructible (Opus codecs init lazily;
+            // a Codec2 switch would throw UnsatisfiedLinkError on the JVM and
+            // mask the race). SHQ decodes stereo, HQ decodes mono — the
+            // receive channel count reveals which switch last owned receive.
+            //
+            // Block the local switch mid-flight: after it set activeProfile=SHQ
+            // and sent its signal, but before it reconfigures transmit/receive.
+            val insideLocalSwitch = CountDownLatch(1)
+            val releaseLocalSwitch = CountDownLatch(1)
+            every { mockTransport.sendSignal(Signalling.PREFERRED_PROFILE + Profile.SHQ.id) } answers {
+                insideLocalSwitch.countDown()
+                assertTrue("local switch must be released", releaseLocalSwitch.await(5, TimeUnit.SECONDS))
+            }
+
+            var localError: Throwable? = null
+            val local =
+                Thread {
+                    try {
+                        telephone.switchProfile(Profile.SHQ)
+                    } catch (e: Throwable) {
+                        localError = e
+                    }
+                }.apply {
+                    name = "local-profile-switch"
+                    start()
+                }
+            assertTrue("local switch must reach sendSignal", insideLocalSwitch.await(5, TimeUnit.SECONDS))
+
+            // A remote PREFERRED_PROFILE(HQ) callback lands while the local
+            // switch is mid-flight — Python delivers signals on its own thread.
+            var remoteError: Throwable? = null
+            val remote =
+                Thread {
+                    try {
+                        signalCallback?.invoke(Signalling.PREFERRED_PROFILE + Profile.HQ.id)
+                    } catch (e: Throwable) {
+                        remoteError = e
+                    }
+                }.apply {
+                    name = "remote-profile-signal"
+                    start()
+                }
+
+            // Let the remote callback either run to completion (unserialized)
+            // or block on the Telephone monitor (serialized), then finish both.
+            Thread.sleep(100)
+            releaseLocalSwitch.countDown()
+            local.join(5000)
+            remote.join(5000)
+            assertFalse("local switch thread must finish", local.isAlive)
+            assertFalse("remote signal thread must finish", remote.isAlive)
+            localError?.let { throw it }
+            remoteError?.let { throw it }
+
+            // The remote switch ran last (serialization guarantees it; without
+            // serialization it completes first and the local receive step
+            // overwrites it). Either way activeProfile and receive must agree:
+            // HQ decodes mono, so receive must be mono. Without serialization
+            // activeProfile=HQ but receive stays SHQ stereo, and incoming mono
+            // HQ packets play as garbled half-speed stereo (Greptile P1 on #26).
+            assertEquals(Profile.HQ, telephone.activeProfile)
+            assertEquals(1, receiveLinkSource().channels)
+            assertEquals(1, receiveLinkSource().codec.codecChannels)
         }
 }
