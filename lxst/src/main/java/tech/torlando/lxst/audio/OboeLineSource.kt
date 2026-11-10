@@ -84,6 +84,7 @@ class OboeLineSource(
     var nativeEncoderOpusBitrate: Int = 0
     var nativeEncoderOpusComplexity: Int = 10
     var nativeEncoderCodec2Mode: Int = 0
+    var nativeEncoderFrameDurationMs: Int = 0
 
     // Audio configuration (derived from codec, same as LineSource)
     override var sampleRate: Int = DEFAULT_SAMPLE_RATE
@@ -161,6 +162,7 @@ class OboeLineSource(
                     opusBitrate = nativeEncoderOpusBitrate,
                     opusComplexity = nativeEncoderOpusComplexity,
                     codec2Mode = nativeEncoderCodec2Mode,
+                    frameDurationMs = nativeEncoderFrameDurationMs,
                 )
             Log.i(TAG, "Native encoder configured: $configured (type=$nativeEncoderCodecType rate=$nativeEncoderSampleRate)")
         }

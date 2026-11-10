@@ -1033,6 +1033,7 @@ class Telephone(
                     nativeEncoderOpusBitrate = encodeParams.opusBitrate
                     nativeEncoderOpusComplexity = encodeParams.opusComplexity
                     nativeEncoderCodec2Mode = encodeParams.codec2LibraryMode
+                    nativeEncoderFrameDurationMs = activeProfile.frameTimeMs
                 }
             Log.d(TAG, "TX pipeline prepared with native encoder: ${encodeParams.codecType} @ ${encodeParams.sampleRate}Hz")
         }
@@ -1179,6 +1180,7 @@ class Telephone(
             nativeEncoderOpusBitrate = encodeParams.opusBitrate
             nativeEncoderOpusComplexity = encodeParams.opusComplexity
             nativeEncoderCodec2Mode = encodeParams.codec2LibraryMode
+            nativeEncoderFrameDurationMs = activeProfile.frameTimeMs
         }
 
         // Restore mute state (atomic bool persists across configureEncoder)

@@ -130,6 +130,7 @@ object NativeCaptureEngine {
         opusBitrate: Int = 0,
         opusComplexity: Int = 10,
         codec2Mode: Int = 0,
+        frameDurationMs: Int = 0,
     ): Boolean {
         if (!ensureLoaded()) return false
         return nativeConfigureEncoder(
@@ -140,6 +141,7 @@ object NativeCaptureEngine {
             opusBitrate,
             opusComplexity,
             codec2Mode,
+            frameDurationMs,
         )
     }
 
@@ -216,6 +218,7 @@ object NativeCaptureEngine {
         opusBitrate: Int,
         opusComplexity: Int,
         codec2Mode: Int,
+        frameDurationMs: Int,
     ): Boolean
 
     private external fun nativeReadEncodedPacket(dest: ByteArray): Int

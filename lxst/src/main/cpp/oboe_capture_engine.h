@@ -90,7 +90,7 @@ public:
      */
     bool configureEncoder(int codecType, int sampleRate, int channels,
                           int opusApp, int opusBitrate, int opusComplexity,
-                          int codec2Mode);
+                          int codec2Mode, int frameDurationMs);
 
     /**
      * Read one encoded packet from the encoded ring buffer.

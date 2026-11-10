@@ -370,7 +370,7 @@ oboe::DataCallbackResult OboeCaptureEngine::onAudioReady(
 
 bool OboeCaptureEngine::configureEncoder(int codecType, int sampleRate, int channels,
                                           int opusApp, int opusBitrate, int opusComplexity,
-                                          int codec2Mode) {
+                                          int codec2Mode, int frameDurationMs) {
     destroyEncoder();
 
     encoder_ = std::make_unique<CodecWrapper>();
@@ -395,15 +395,38 @@ bool OboeCaptureEngine::configureEncoder(int codecType, int sampleRate, int chan
     encoderRate_ = sampleRate;
     resampler_.reset();
 
-    // Samples per encoder frame. The codec frame size is a function of the
-    // ENCODER rate (Codec2 @8k = 160, Opus @48k = 960 for a 20ms frame), so the
-    // encoder-rate accumulator emits chunks of this size - not the capture-rate
-    // frameSamples_ - guaranteeing every encode() call gets an exact codec frame
-    // (Opus rejects non-standard sizes; Codec2's numFrames = samples / spf would
-    // otherwise drop a truncated frame). frameSamples_ is frameDurationMs at the
-    // requested (sampleRate_) rate, so the same duration at the encoder rate is:
-    encoderFrameSize_ = static_cast<int>(
-        frameSamples_ * (static_cast<double>(sampleRate) / sampleRate_) + 0.5);
+    // Samples per encoder PACKET: the profile's full frame duration at the
+    // encoder rate, matching the Kotlin Codec2/Opus encoders and Python LXST,
+    // which emit one packet per profile frame (e.g. VLBW = 320ms = 8 codec2
+    // quanta = 64 bytes + mode header). Deriving this from the capture frame
+    // duration (frameSamples_) instead pins the packet length to the profile
+    // that was active when the engine was CREATED: a mid-call profile switch
+    // then emits stale-length chunks (MQ→VLBW sent 40ms codec2 quanta into a
+    // 320ms RX ring that never filled — columba#1238).
+    int frameSize;
+    if (frameDurationMs > 0) {
+        frameSize = static_cast<int>(
+            sampleRate * channels * (frameDurationMs / 1000.0) + 0.5);
+        if (codecType == static_cast<int>(CodecType::CODEC2)) {
+            // Codec2 only accepts whole 40ms quanta. Round the profile frame
+            // to the nearest quantum count (all profile frame times are exact
+            // multiples today; this guards future ones).
+            const int spf = encoder_->codec2SamplesPerFrame();
+            if (spf > 0) {
+                int quanta = (frameSize + spf / 2) / spf;
+                if (quanta < 1) quanta = 1;
+                frameSize = quanta * spf;
+            }
+        }
+    } else {
+        // Legacy: capture frame duration scaled to the encoder rate. The codec
+        // frame size is a function of the ENCODER rate, so the encoder-rate
+        // accumulator emits chunks of this size and every encode() call gets
+        // an exact codec frame.
+        frameSize = static_cast<int>(
+            frameSamples_ * (static_cast<double>(sampleRate) / sampleRate_) + 0.5);
+    }
+    encoderFrameSize_ = frameSize;
 
     // Encoded ring buffer: 32 slots, 1500 bytes max per slot
     encodedRingBuffer_ = std::make_unique<EncodedRingBuffer>(32, 1500);

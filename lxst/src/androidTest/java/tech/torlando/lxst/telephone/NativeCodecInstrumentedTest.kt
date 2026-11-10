@@ -717,13 +717,100 @@ class NativeCodecInstrumentedTest {
             opusBitrate = llParams.opusBitrate,
             opusComplexity = llParams.opusComplexity,
             codec2Mode = llParams.codec2LibraryMode,
+            frameDurationMs = Profile.LL.frameTimeMs,
         )
 
         Thread.sleep(1500)
 
         var llPackets = 0
-        while (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) llPackets++
+        var firstLlDecoded = -1
+        while (true) {
+            val len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len <= 0) break
+            llPackets++
+            if (llPackets == 1) {
+                // LL frames are 20ms; decoded at the VOICE_HIGH 48kHz decode
+                // rate that is exactly 960 samples — the RX ring frame size.
+                val llDecode = trackCodec(Profile.LL.createDecodeCodec())
+                firstLlDecoded = llDecode.decode(encodedBuf.copyOf(len)).size
+            }
+        }
         assertTrue("LL phase should produce >=5 packets (got $llPackets)", llPackets >= 5)
+        assertEquals("LL packets must carry the 20ms profile frame", 960, firstLlDecoded)
+    }
+
+    @Test
+    fun nativeEncoder_reconfig_mqToVlbw_emitsFullProfileFramePackets() {
+        // Regression for columba#1238: after a mid-call MQ→VLBW switch the
+        // native TX must emit ONE PACKET PER VLBW PROFILE FRAME (320ms =
+        // 8 codec2 quanta = 64 bytes + mode header = 65 bytes). The old
+        // formula derived the packet length from the capture frame duration
+        // of the profile that was active when the engine was CREATED (MQ:
+        // 60ms), so it emitted 40ms quanta into the 320ms RX ring — the ring
+        // never filled and both directions went silent.
+        val mqParams = Profile.MQ.nativeEncodeParams()
+        val created =
+            NativeCaptureEngine.create(
+                sampleRate = mqParams.sampleRate,
+                channels = mqParams.channels,
+                frameSamples = mqParams.sampleRate * Profile.MQ.frameTimeMs / 1000,
+                maxBufferFrames = 75,
+                enableFilters = true,
+            )
+        assertTrue("Capture engine should create", created)
+
+        NativeCaptureEngine.configureEncoder(
+            codecType = mqParams.codecType,
+            sampleRate = mqParams.sampleRate,
+            channels = mqParams.channels,
+            opusApp = mqParams.opusApplication,
+            opusBitrate = mqParams.opusBitrate,
+            opusComplexity = mqParams.opusComplexity,
+            codec2Mode = mqParams.codec2LibraryMode,
+        )
+        assertTrue("Capture stream should start", NativeCaptureEngine.startStream())
+        Thread.sleep(500)
+
+        // Drain MQ-era packets.
+        val encodedBuf = ByteArray(1500)
+        while (NativeCaptureEngine.readEncodedPacket(encodedBuf) > 0) {}
+
+        // Switch to VLBW (codec2 1600 @8k, 320ms profile frame) exactly as
+        // Telephone.reconfigureTransmitNativeCodec does: stop the stream,
+        // destroy the encoder, reconfigure, restart (openStream re-rates the
+        // capture→encoder resampler for the new encoder rate).
+        NativeCaptureEngine.stopStream()
+        NativeCaptureEngine.destroyEncoder()
+        val vlbwParams = Profile.VLBW.nativeEncodeParams()
+        assertTrue(
+            "VLBW encoder should configure",
+            NativeCaptureEngine.configureEncoder(
+                codecType = vlbwParams.codecType,
+                sampleRate = vlbwParams.sampleRate,
+                channels = vlbwParams.channels,
+                codec2Mode = vlbwParams.codec2LibraryMode,
+                frameDurationMs = Profile.VLBW.frameTimeMs,
+            ),
+        )
+        assertTrue("Capture stream should restart", NativeCaptureEngine.startStream())
+
+        // Wait for the first VLBW packet (320ms frame period + capture latency).
+        var len = 0
+        val deadline = System.currentTimeMillis() + 5000
+        while (len <= 0 && System.currentTimeMillis() < deadline) {
+            len = NativeCaptureEngine.readEncodedPacket(encodedBuf)
+            if (len <= 0) Thread.sleep(20)
+        }
+        NativeCaptureEngine.stopStream()
+        assertTrue("VLBW encoder must produce packets", len > 0)
+
+        // Full profile frame: 8 quanta × 8 bytes + 1 mode header = 65 bytes.
+        assertEquals("VLBW packet must carry the full 320ms profile frame", 65, len)
+
+        // And it must decode to exactly one RX ring frame (320ms @8k = 2560).
+        val vlbwDecode = trackCodec(Profile.VLBW.createDecodeCodec())
+        val decoded = vlbwDecode.decode(encodedBuf.copyOf(len))
+        assertEquals("VLBW packet must decode to the RX ring frame size", 2560, decoded.size)
     }
 
     // =====================================================================
