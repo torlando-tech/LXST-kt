@@ -1227,7 +1227,9 @@ class NativeCodecInstrumentedTest {
     fun nativeDecoder_prebuffer_preventsExcessiveSilence() {
         sinePhase = 0.0
         val decFrameSamples = 48000 * 60 / 1000 // 2880 (HQ: 60ms at 48kHz)
-        val framesToLoad = 15 // 900ms of audio pre-loaded
+        // Stay under the adaptive-drain ceiling (2x prebuffer = 10 frames,
+        // f6e5bcb bounds burst latency): 9 frames = 540ms pre-loaded.
+        val framesToLoad = 9
 
         val created =
             NativePlaybackEngine.create(
@@ -1271,10 +1273,10 @@ class NativeCodecInstrumentedTest {
         val started = NativePlaybackEngine.startStream()
         assertTrue("Oboe stream should start", started)
 
-        // Wait for ~60% of audio to play (540ms of 900ms), then check.
-        // All data was pre-loaded, so the callback should have zero silence
-        // during this window.
-        Thread.sleep(540)
+        // Wait for most of the pre-loaded audio to play (480ms of 540ms),
+        // then check. All data was pre-loaded and below the adaptive-drain
+        // ceiling, so the callback should have zero silence in this window.
+        Thread.sleep(480)
 
         val cbFrames = NativePlaybackEngine.getCallbackFrameCount()
         val cbSilence = NativePlaybackEngine.getCallbackSilenceCount()
@@ -1300,6 +1302,65 @@ class NativeCodecInstrumentedTest {
         Thread.sleep(600)
 
         NativePlaybackEngine.destroyDecoder()
+    }
+
+    /**
+     * Adaptive playout drain (f6e5bcb): a burst larger than 2x prebuffer is
+     * trimmed to the prebuffer level on the first callback so Reticulum
+     * bursts cannot ratchet playback latency up. Pre-load 15 frames with
+     * prebuffer=5: without the drain the buffer would still hold ~13 frames
+     * 100ms after start; with it, buffered must sit at or below the 10-frame
+     * ceiling.
+     */
+    @Test
+    fun nativeDecoder_burstPreload_adaptiveDrainBoundsLatency() {
+        sinePhase = 0.0
+        val decFrameSamples = 48000 * 60 / 1000
+
+        val created =
+            NativePlaybackEngine.create(
+                sampleRate = 48000,
+                channels = 1,
+                frameSamples = decFrameSamples,
+                maxBufferFrames = 75,
+                prebufferFrames = PREBUFFER_FRAMES,
+            )
+        assertTrue("Playback engine should create", created)
+        playbackEngineCreated = true
+
+        val hqDecParams = Profile.HQ.nativeDecodeParams()
+        NativePlaybackEngine.configureDecoder(
+            codecType = hqDecParams.codecType,
+            sampleRate = hqDecParams.sampleRate,
+            channels = hqDecParams.channels,
+            opusApp = hqDecParams.opusApplication,
+            opusBitrate = hqDecParams.opusBitrate,
+            opusComplexity = hqDecParams.opusComplexity,
+            codec2Mode = hqDecParams.codec2LibraryMode,
+        )
+
+        // 15-frame burst = 3x the prebuffer, 1.5x the drain ceiling.
+        val enc = trackCodec(Profile.HQ.createCodec())
+        repeat(15) {
+            val pcm = generateSineFrame(48000, 1, 60)
+            val encoded = enc.encode(pcm)
+            NativePlaybackEngine.writeEncodedPacket(encoded, 0, encoded.size)
+        }
+        assertTrue("Oboe stream should start", NativePlaybackEngine.startStream())
+
+        // Give the callback a couple of bursts to run the drain, then sample
+        // the level. Consumption in 100ms is at most ~2 frames, so a buffer
+        // that was never drained cannot fall below 13.
+        Thread.sleep(100)
+        val buffered = NativePlaybackEngine.getBufferedFrameCount()
+        NativePlaybackEngine.stopStream()
+        NativePlaybackEngine.destroyDecoder()
+        assertTrue(
+            "Burst of 15 frames (prebuffer=5, ceiling=10) must be trimmed to " +
+                "<=10 frames by the adaptive drain; buffered=$buffered. " +
+                ">10 means the latency bound regressed.",
+            buffered <= 10,
+        )
     }
 
     // =====================================================================
