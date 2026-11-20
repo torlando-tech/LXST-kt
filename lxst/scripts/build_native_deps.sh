@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Cross-compile libcodec2.so and libopus.so for Android ABIs using NDK r21e.
+# Cross-compile libcodec2.so and libopus.so for Android ABIs using NDK r28c.
+#
+# NDK r28+ is required for Google Play 16 KB page-size compliance: older
+# prebuilts were 4 KB-aligned (p_align 0x1000) and were flagged by Play as
+# "Recompile your app with 16 KB native library alignment" plus the
+# "compiled with an older Android NDK" crash advisory. r28 aligns LOAD
+# segments to 0x4000 by default; the linker flags below keep that explicit.
 #
 # Usage: ./build_native_deps.sh [abi]
 #   abi: armeabi-v7a | arm64-v8a | all (default: armeabi-v7a)
 #
-# Prerequisites: Android NDK r21e at $ANDROID_HOME/ndk/21.4.7075529
+# Prerequisites: Android NDK r28c at $ANDROID_HOME/ndk/28.2.13676358
 #                git, cmake, make
 
 set -euo pipefail
@@ -14,10 +20,18 @@ LXST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 JNILIBS_DIR="$LXST_DIR/src/main/jniLibs"
 BUILD_ROOT="/tmp/lxst-native-build"
 
-NDK_VERSION="21.4.7075529"
+NDK_VERSION="28.2.13676358"
 NDK_DIR="${ANDROID_HOME:?Set ANDROID_HOME to your Android SDK path}/ndk/$NDK_VERSION"
 CMAKE_TOOLCHAIN="$NDK_DIR/build/cmake/android.toolchain.cmake"
 API_LEVEL=24  # Match minSdk in build.gradle.kts
+
+# 16 KB page-size compatibility (required by Google Play for targetSdk 35+).
+# NDK r28 defaults to this, but pass it explicitly so a downgraded NDK fails
+# loudly in review rather than silently shipping 4 KB-aligned prebuilts.
+PAGE_SIZE_FLAGS=(
+    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+    "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+)
 
 OPUS_VERSION="v1.5.2"
 OPUS_REPO="https://github.com/xiph/opus.git"
@@ -32,8 +46,16 @@ TARGET_ABI="${1:-armeabi-v7a}"
 log() { echo "==> $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# CMake Release output keeps .debug/.symtab; strip so the AAR (and every
+# consumer APK) doesn't carry ~1 MB of unused symbols per library. Matches the
+# previously shipped prebuilts, which were stripped.
+LLVM_STRIP="$(find "$NDK_DIR/toolchains/llvm/prebuilt" -name llvm-strip | head -1)"
+[[ -x "$LLVM_STRIP" ]] || die "llvm-strip not found under $NDK_DIR"
+
+strip_lib() { "$LLVM_STRIP" --strip-unneeded "$1"; }
+
 check_prereqs() {
-    [[ -d "$NDK_DIR" ]] || die "NDK r21e not found at $NDK_DIR"
+    [[ -d "$NDK_DIR" ]] || die "NDK $NDK_VERSION not found at $NDK_DIR"
     [[ -f "$CMAKE_TOOLCHAIN" ]] || die "CMake toolchain not found"
     command -v cmake >/dev/null || die "cmake not found"
     command -v git >/dev/null || die "git not found"
@@ -85,6 +107,7 @@ build_opus() {
         -DANDROID_ABI="$abi" \
         -DANDROID_NATIVE_API_LEVEL="$API_LEVEL" \
         -DANDROID_STL=c++_shared \
+        "${PAGE_SIZE_FLAGS[@]}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DOPUS_BUILD_SHARED_LIBRARY=ON \
         -DOPUS_BUILD_TESTING=OFF \
@@ -95,6 +118,7 @@ build_opus() {
     cmake --build "$build_dir" --parallel "$(nproc)"
 
     cp "$build_dir/libopus.so" "$out_dir/libopus.so"
+    strip_lib "$out_dir/libopus.so"
     log "Opus built: $out_dir/libopus.so"
 }
 
@@ -122,6 +146,7 @@ build_codec2() {
         -DANDROID_ABI="$abi" \
         -DANDROID_NATIVE_API_LEVEL="$API_LEVEL" \
         -DANDROID_STL=c++_shared \
+        "${PAGE_SIZE_FLAGS[@]}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=ON \
         -DLPCNET=OFF \
@@ -142,6 +167,7 @@ build_codec2() {
 
     # Follow symlinks to get actual file
     cp -L "$built_so" "$out_dir/libcodec2.so"
+    strip_lib "$out_dir/libcodec2.so"
     log "Codec2 built: $out_dir/libcodec2.so"
 }
 

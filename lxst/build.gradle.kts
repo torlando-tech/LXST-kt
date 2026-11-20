@@ -85,8 +85,11 @@ afterEvaluate {
 }
 
 dependencies {
-    // Native audio (Oboe C++ via Prefab)
-    implementation("com.google.oboe:oboe:1.9.0")
+    // Native audio (Oboe C++ via Prefab). Oboe <1.9.3 ships 4 KB-aligned
+    // liboboe.so prebuilts (NDK r25c, p_align 0x1000) which Google Play flags
+    // as not 16 KB page-size compliant. 1.11.0 is NDK r30-built and 16 KB
+    // aligned (p_align 0x4000).
+    implementation("com.google.oboe:oboe:1.11.0")
 
     // Coroutines
     implementation(libs.coroutines.core)
