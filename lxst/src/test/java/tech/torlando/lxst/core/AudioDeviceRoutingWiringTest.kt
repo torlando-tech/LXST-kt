@@ -13,6 +13,7 @@ import io.mockk.Runs
 import io.mockk.every
 import io.mockk.just
 import io.mockk.mockk
+import io.mockk.slot
 import io.mockk.verify
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -34,6 +35,8 @@ class AudioDeviceRoutingWiringTest {
     private lateinit var context: Context
     private lateinit var audioManager: AudioManager
     private lateinit var audioBridge: AudioDevice
+
+    private val communicationDeviceListener = slot<AudioManager.OnCommunicationDeviceChangedListener>()
 
     private val earpieceInfo =
         mockk<AudioDeviceInfo> {
@@ -71,6 +74,8 @@ class AudioDeviceRoutingWiringTest {
         every { audioManager.clearCommunicationDevice() } returns Unit
         every { audioManager.registerAudioDeviceCallback(any(), any()) } returns Unit
         every { audioManager.unregisterAudioDeviceCallback(any()) } returns Unit
+        every { audioManager.addOnCommunicationDeviceChangedListener(any(), capture(communicationDeviceListener)) } returns Unit
+        every { audioManager.removeOnCommunicationDeviceChangedListener(any()) } returns Unit
     }
 
     @After
@@ -208,6 +213,25 @@ class AudioDeviceRoutingWiringTest {
         // Automatic policy prefers the connected headset again.
         verify(exactly = 2) { audioManager.setCommunicationDevice(btScoInfo) }
         audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
+    fun `call audio routing follows platform communication device changes`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+
+        audioBridge.enterVoiceCallMode(speakerphone = true)
+        verify(exactly = 1) { audioManager.addOnCommunicationDeviceChangedListener(any(), any()) }
+
+        // The platform confirms the switch after setCommunicationDevice returns;
+        // rebinding then is what keeps audio alive on the new route.
+        val listener = communicationDeviceListener.captured
+        audioBridge.selectCallAudioDevice(3)
+        listener.onCommunicationDeviceChanged(btScoInfo)
+        verify(exactly = 1) { audioManager.setCommunicationDevice(btScoInfo) }
+
+        audioBridge.exitVoiceCallMode()
+        verify(exactly = 1) { audioManager.removeOnCommunicationDeviceChangedListener(listener) }
     }
 
     @Test

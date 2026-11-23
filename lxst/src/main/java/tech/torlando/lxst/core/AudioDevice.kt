@@ -22,6 +22,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import tech.torlando.lxst.audio.NativePlaybackEngine
 import java.util.concurrent.LinkedBlockingQueue
@@ -66,6 +67,12 @@ class AudioDevice(
         const val DEFAULT_CHANNELS = 1
         const val DEFAULT_FRAME_SIZE_MS = 20 // 20ms frames
         const val BUFFER_QUEUE_SIZE = 20 // Number of audio frames to buffer (increased for smoother playback)
+
+        // Communication-device switches resolve asynchronously; give the
+        // platform time to apply the route before rebinding, and a bounded
+        // window to confirm it before retrying once.
+        private const val ROUTE_SETTLE_DELAY_MS = 1500L
+        private const val ROUTE_CONFIRM_TIMEOUT_MS = 1500L
 
         @Volatile
         private var instance: AudioDevice? = null
@@ -147,6 +154,14 @@ class AudioDevice(
     private var callAudioActive = false
 
     private val deviceCallbackRegistered = AtomicBoolean(false)
+
+    // Route changes land asynchronously after setCommunicationDevice(); this
+    // listener rebinds the playback streams once the platform actually switched,
+    // instead of rebinding against the old route and leaving silence.
+    private val communicationDeviceCallbackRegistered = AtomicBoolean(false)
+
+    @Volatile
+    private var communicationDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
 
     private val audioDeviceCallback =
         object : AudioDeviceCallback() {
@@ -829,6 +844,7 @@ class AudioDevice(
         synchronized(routingLock) {
             callAudioActive = false
             userSelectedDeviceId = null
+            unregisterCommunicationDeviceListener()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 audioManager.clearCommunicationDevice()
             }
@@ -946,8 +962,43 @@ class AudioDevice(
                 TAG,
                 "📞 User selected call audio device: ${device.productName} (type=${device.type}) success=$success",
             )
-            restartCallAudioStreams()
+            if (audioManager.communicationDevice?.id == deviceId) {
+                // Route already active (re-selecting the current device): rebind now.
+                restartCallAudioStreams()
+            } else {
+                // The switch is asynchronous; rebinding now would target the
+                // previous route and can leave the call silent.
+                scheduleRouteSettledRebind(device)
+            }
             return success
+        }
+    }
+
+    /**
+     * `setCommunicationDevice()` is asynchronous: rebinding immediately targets
+     * the previous route and can leave silence on the new one. Rebind again once
+     * the route has settled, and retry the request once if the platform never
+     * applied it (seen on some Bluetooth stacks), so the user does not have to
+     * select the same device twice to get audio.
+     */
+    private fun scheduleRouteSettledRebind(device: AudioDeviceInfo) {
+        val deviceId = device.id
+        scope.launch {
+            delay(ROUTE_SETTLE_DELAY_MS)
+            synchronized(routingLock) {
+                if (!callAudioActive || userSelectedDeviceId != deviceId) return@launch
+                Log.i(TAG, "📞 Rebinding call audio streams after route change")
+                restartCallAudioStreams()
+                if (audioManager.communicationDevice?.id == deviceId) return@launch
+            }
+            delay(ROUTE_CONFIRM_TIMEOUT_MS)
+            synchronized(routingLock) {
+                if (!callAudioActive || userSelectedDeviceId != deviceId) return@launch
+                if (audioManager.communicationDevice?.id == deviceId) return@launch
+                Log.w(TAG, "📞 Route to device $deviceId did not take; retrying after clear")
+                audioManager.clearCommunicationDevice()
+                audioManager.setCommunicationDevice(device)
+            }
         }
     }
 
@@ -1183,6 +1234,17 @@ class AudioDevice(
         if (deviceCallbackRegistered.compareAndSet(false, true)) {
             audioManager.registerAudioDeviceCallback(audioDeviceCallback, Handler(Looper.getMainLooper()))
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            communicationDeviceCallbackRegistered.compareAndSet(false, true)
+        ) {
+            val listener =
+                AudioManager.OnCommunicationDeviceChangedListener { device ->
+                    Log.i(TAG, "📞 Communication device changed: ${device?.productName} (type=${device?.type})")
+                    onCommunicationDeviceChanged()
+                }
+            communicationDeviceListener = listener
+            audioManager.addOnCommunicationDeviceChangedListener(context.mainExecutor, listener)
+        }
     }
 
     /** Stop following device changes once neither playback nor capture is active. */
@@ -1192,6 +1254,30 @@ class AudioDevice(
         if (deviceCallbackRegistered.compareAndSet(true, false)) {
             audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
         }
+        unregisterCommunicationDeviceListener()
+    }
+
+    /**
+     * Rebind playback streams after the platform confirms a new communication
+     * device. `setCommunicationDevice()` resolves asynchronously, so an
+     * immediate rebind can open the stream on the old route and leave the call
+     * silent on the new one.
+     */
+    private fun onCommunicationDeviceChanged() {
+        synchronized(routingLock) {
+            if (!callAudioActive) return
+            Log.i(TAG, "📞 Rebinding call audio streams for the new communication device")
+            restartCallAudioStreams()
+        }
+    }
+
+    private fun unregisterCommunicationDeviceListener() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        val listener = communicationDeviceListener
+        if (communicationDeviceCallbackRegistered.compareAndSet(true, false) && listener != null) {
+            audioManager.removeOnCommunicationDeviceChangedListener(listener)
+        }
+        communicationDeviceListener = null
     }
 
     /**
@@ -1371,6 +1457,7 @@ class AudioDevice(
         stopRecording()
         synchronized(routingLock) {
             callAudioActive = false
+            unregisterCommunicationDeviceListener()
             if (deviceCallbackRegistered.compareAndSet(true, false)) {
                 audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
             }
