@@ -131,6 +131,12 @@ class AudioDevice(
     @Volatile
     private var speakerphoneOn = false // Default to earpiece
 
+    // Output device the user explicitly picked in the in-call audio picker.
+    // Null = automatic policy (speaker on/off, headset preference). Survives
+    // device add/remove while the chosen device remains available.
+    @Volatile
+    private var userSelectedDeviceId: Int? = null
+
     // Output type of the last applied communication-device route (null = platform default
     // or legacy speakerphone). Used to decide whether a device add/remove changes routing.
     @Volatile
@@ -799,6 +805,7 @@ class AudioDevice(
             val previousMode = audioManager.mode
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
             speakerphoneOn = speakerphone
+            userSelectedDeviceId = null
             Log.i(TAG, "📞 Voice call mode: $previousMode -> ${audioManager.mode}")
 
             // Log volume levels
@@ -821,6 +828,7 @@ class AudioDevice(
     fun exitVoiceCallMode() {
         synchronized(routingLock) {
             callAudioActive = false
+            userSelectedDeviceId = null
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 audioManager.clearCommunicationDevice()
             }
@@ -844,32 +852,122 @@ class AudioDevice(
      */
     @Suppress("DEPRECATION")
     fun setSpeakerphoneOn(enabled: Boolean) {
-        speakerphoneOn = enabled
-        Log.i(TAG, "📞 setSpeakerphoneOn($enabled)")
-
         synchronized(routingLock) {
+            speakerphoneOn = enabled
+            // The legacy speaker toggle is the automatic path; an explicit picker
+            // selection must not silently override the user's tap.
+            userSelectedDeviceId = null
+            Log.i(TAG, "📞 setSpeakerphoneOn($enabled)")
             applyCommunicationRoute(enabled)
-
-            // Recreate AudioTrack to pick up new routing. Many HALs (Samsung Fold3,
-            // some Pixels) don't dynamically re-route an already-playing AudioTrack
-            // when setCommunicationDevice() changes. A fresh AudioTrack inherits the
-            // current routing state from the system at creation time.
-            if (isPlaying.get()) {
-                restartAudioTrack()
-            }
-
-            // Restart native Oboe stream for voice call audio (OboeLineSink).
-            // Oboe streams bind to a hardware device at open time and don't follow
-            // system routing changes — must close and reopen to pick up new routing.
-            // Don't gate on isPlaying() — restartStream() handles the not-created
-            // case internally, and gating here prevents recovery if the stream died.
-            try {
-                NativePlaybackEngine.restartStream()
-            } catch (_: UnsatisfiedLinkError) {
-                // Native library not loaded — no Oboe stream to restart
-            }
+            restartCallAudioStreams()
         }
     }
+
+    // ===== Call audio device picker (in-call output selection) =====
+
+    /**
+     * Output devices the platform offers for call audio, in the order to show
+     * them. Android 12+ uses [AudioManager.getAvailableCommunicationDevices],
+     * the set `setCommunicationDevice()` accepts — builtin earpiece/speaker,
+     * Bluetooth SCO/LE, hearing aids, wired and USB headsets. Output-only
+     * devices (e.g. wired headphones without a mic) are not selectable and
+     * therefore not listed; platform routing still sends call audio to them
+     * while automatic routing is active.
+     *
+     * Below Android 12 only earpiece and speaker can be chosen explicitly; the
+     * ids are the builtin [AudioDeviceInfo] types because there is no
+     * selectable-device collection to take ids from.
+     */
+    fun availableCallAudioDevices(): List<CallAudioDevice> =
+        synchronized(routingLock) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.availableCommunicationDevices.map { device ->
+                    CallAudioDevice(
+                        id = device.id,
+                        type = device.type,
+                        name = device.productName?.toString().orEmpty(),
+                    )
+                }
+            } else {
+                listOf(
+                    CallAudioDevice(
+                        id = AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
+                        type = AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
+                        name = "Earpiece",
+                    ),
+                    CallAudioDevice(
+                        id = AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+                        type = AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+                        name = "Speaker",
+                    ),
+                )
+            }
+        }
+
+    /**
+     * Route call audio to [deviceId], one of [availableCallAudioDevices].
+     *
+     * The choice survives device add/remove while that device stays available;
+     * once it disappears the automatic policy (speaker toggle, headset
+     * preference) takes over. Toggling the speaker with [setSpeakerphoneOn]
+     * cancels the explicit choice. Playback streams are restarted so already
+     * playing AudioTracks/Oboe streams move to the new device.
+     *
+     * @return true when the platform accepted the selection (or the legacy
+     *   speaker toggle was applied below Android 12)
+     */
+    @Suppress("DEPRECATION")
+    fun selectCallAudioDevice(deviceId: Int): Boolean {
+        synchronized(routingLock) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                // Legacy platform: the only explicit routes are earpiece/speaker.
+                if (deviceId != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE && deviceId != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    Log.w(TAG, "📞 selectCallAudioDevice($deviceId): not a legacy route")
+                    return false
+                }
+                speakerphoneOn = deviceId == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                userSelectedDeviceId = null
+                applyCommunicationRoute(speakerphoneOn)
+                restartCallAudioStreams()
+                return true
+            }
+
+            val device = audioManager.availableCommunicationDevices.firstOrNull { it.id == deviceId }
+            if (device == null) {
+                Log.w(TAG, "📞 selectCallAudioDevice($deviceId): no longer available")
+                return false
+            }
+
+            userSelectedDeviceId = deviceId
+            speakerphoneOn = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            val success = audioManager.setCommunicationDevice(device)
+            appliedRouteType = device.type
+            Log.i(
+                TAG,
+                "📞 User selected call audio device: ${device.productName} (type=${device.type}) success=$success",
+            )
+            restartCallAudioStreams()
+            return success
+        }
+    }
+
+    /**
+     * Id of the device call audio is currently routed to, or null when the
+     * platform reports none. On Android 12+ this is the active communication
+     * device, which reflects the platform's own routing (automatic selection,
+     * device removal fallback) rather than what was last requested.
+     */
+    @Suppress("DEPRECATION")
+    fun currentCallAudioDeviceId(): Int? =
+        synchronized(routingLock) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.communicationDevice?.id
+            } else if (audioManager.isSpeakerphoneOn) {
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            } else {
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            }
+        }
 
     /**
      * Recreate the AudioTrack to pick up changed audio routing.
@@ -983,6 +1081,26 @@ class AudioDevice(
             Log.d(TAG, "📞 Legacy speakerphone set: $useSpeaker")
             return
         }
+
+        // A device the user picked in the in-call audio picker wins over the
+        // automatic policy until it disappears.
+        val explicitSelection = userSelectedDeviceId
+        if (explicitSelection != null) {
+            val explicitDevice =
+                audioManager.availableCommunicationDevices.firstOrNull { it.id == explicitSelection }
+            if (explicitDevice != null) {
+                val success = audioManager.setCommunicationDevice(explicitDevice)
+                appliedRouteType = explicitDevice.type
+                Log.i(
+                    TAG,
+                    "📞 Selected call audio device: ${explicitDevice.productName} (type=${explicitDevice.type}) success=$success",
+                )
+                return
+            }
+            Log.i(TAG, "📞 Selected call audio device $explicitSelection is gone; returning to automatic routing")
+            userSelectedDeviceId = null
+        }
+
         var nextRouteType: Int? = null
         try {
             val availableDevices = audioManager.availableCommunicationDevices
@@ -1261,7 +1379,22 @@ class AudioDevice(
     }
 }
 
-/** Routing decision for call audio. */
+/**
+ * An output device offered for call audio, suitable for an in-call device picker.
+ *
+ * [id] is an `AudioDeviceInfo.id` on Android 12+; below Android 12 it is the
+ * builtin device type, because the platform exposes no selectable-device ids.
+ * [name] is the platform product name; builtin earpiece/speaker names should be
+ * localized by the app UI rather than shown verbatim.
+ */
+data class CallAudioDevice(
+    val id: Int,
+    val type: Int,
+    val name: String,
+) {
+    val isSpeaker: Boolean get() = type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+}
+
 internal sealed interface CallAudioRoute {
     /** Select the platform communication device with [outputType]. */
     data class Select(val outputType: Int) : CallAudioRoute

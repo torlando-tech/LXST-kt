@@ -15,6 +15,9 @@ import io.mockk.just
 import io.mockk.mockk
 import io.mockk.verify
 import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -34,16 +37,19 @@ class AudioDeviceRoutingWiringTest {
 
     private val earpieceInfo =
         mockk<AudioDeviceInfo> {
+            every { id } returns 1
             every { type } returns AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
             every { productName } returns "Earpiece"
         }
     private val speakerInfo =
         mockk<AudioDeviceInfo> {
+            every { id } returns 2
             every { type } returns AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
             every { productName } returns "Speaker"
         }
     private val btScoInfo =
         mockk<AudioDeviceInfo> {
+            every { id } returns 3
             every { type } returns AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             every { productName } returns "Headset"
         }
@@ -130,5 +136,87 @@ class AudioDeviceRoutingWiringTest {
         verify(exactly = 2) { audioManager.setCommunicationDevice(speakerInfo) }
         verify(exactly = 0) { audioManager.setCommunicationDevice(btScoInfo) }
         audioBridge.exitVoiceCallMode()
+    }
+
+    // ===== Explicit in-call device selection =====
+
+    @Test
+    fun `available devices mirror the platform selectable list`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+
+        val devices = audioBridge.availableCallAudioDevices()
+
+        assertEquals(listOf(1, 2, 3), devices.map { it.id })
+        assertEquals(listOf("Earpiece", "Speaker", "Headset"), devices.map { it.name })
+    }
+
+    @Test
+    fun `selecting a headset routes to it and survives device changes`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+        audioBridge.enterVoiceCallMode(speakerphone = true)
+
+        assertTrue(audioBridge.selectCallAudioDevice(3))
+        verify(exactly = 1) { audioManager.setCommunicationDevice(btScoInfo) }
+
+        audioBridge.onCallAudioDevicesChanged()
+
+        verify(exactly = 2) { audioManager.setCommunicationDevice(btScoInfo) }
+        verify(exactly = 0) { audioManager.setCommunicationDevice(earpieceInfo) }
+        audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
+    fun `selecting the speaker keeps it over automatic headset routing`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+        audioBridge.enterVoiceCallMode(speakerphone = true)
+
+        assertTrue(audioBridge.selectCallAudioDevice(2))
+        audioBridge.onCallAudioDevicesChanged()
+
+        verify(exactly = 3) { audioManager.setCommunicationDevice(speakerInfo) }
+        verify(exactly = 0) { audioManager.setCommunicationDevice(btScoInfo) }
+        audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
+    fun `removing the selected device falls back to automatic routing`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+        audioBridge.enterVoiceCallMode(speakerphone = true)
+        assertTrue(audioBridge.selectCallAudioDevice(3))
+
+        every { audioManager.availableCommunicationDevices } returns listOf(earpieceInfo, speakerInfo)
+        audioBridge.onCallAudioDevicesChanged()
+
+        verify(exactly = 1) { audioManager.setCommunicationDevice(earpieceInfo) }
+        verify(exactly = 1) { audioManager.setCommunicationDevice(speakerInfo) }
+        audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
+    fun `speaker toggle cancels an explicit selection`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+        audioBridge.enterVoiceCallMode(speakerphone = true)
+        assertTrue(audioBridge.selectCallAudioDevice(3))
+
+        audioBridge.setSpeakerphoneOn(false)
+
+        // Automatic policy prefers the connected headset again.
+        verify(exactly = 2) { audioManager.setCommunicationDevice(btScoInfo) }
+        audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
+    fun `selecting an unavailable device is rejected`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo)
+
+        assertFalse(audioBridge.selectCallAudioDevice(3))
+
+        verify(exactly = 0) { audioManager.setCommunicationDevice(any()) }
     }
 }
