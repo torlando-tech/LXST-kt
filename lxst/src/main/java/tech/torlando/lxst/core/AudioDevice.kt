@@ -96,6 +96,14 @@ class AudioDevice(
     private var audioTrack: AudioTrack? = null
     private val isPlaying = AtomicBoolean(false)
 
+    // Serializes AudioTrack replacement with teardown: a device-change restart that races
+    // hangup must never publish a playing track after stopPlayback() released the old one.
+    private val audioTrackLock = Any()
+
+    // Serializes communication-device routing with teardown, so a device-change callback
+    // that already passed the call-active check cannot re-select a device after hangup.
+    private val routingLock = Any()
+
     @Volatile
     private var playbackSampleRate = DEFAULT_SAMPLE_RATE
 
@@ -256,7 +264,7 @@ class AudioDevice(
                 trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             }
 
-            audioTrack = trackBuilder.build()
+            audioTrack = synchronized(audioTrackLock) { trackBuilder.build() }
 
             // Log AudioTrack state
             val track = audioTrack
@@ -276,8 +284,10 @@ class AudioDevice(
             Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
 
             // Apply audio routing (headset-aware on Android 12+, legacy speakerphone below)
-            activateCallAudioRouting()
-            applyCommunicationRoute(speakerphoneOn)
+            synchronized(routingLock) {
+                activateCallAudioRouting()
+                applyCommunicationRoute(speakerphoneOn)
+            }
 
             // Log available output devices
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -302,10 +312,19 @@ class AudioDevice(
      * so playback starts with a full prebuffer — no race with DMA consumption.
      */
     fun beginPlayback() {
-        audioTrack?.play()
-        val playState = audioTrack?.playState
+        val track =
+            synchronized(audioTrackLock) {
+                val current = audioTrack
+                if (current == null) {
+                    Log.w(TAG, "📞 beginPlayback: no AudioTrack (playback torn down)")
+                    return
+                }
+                current.play()
+                isPlaying.set(true)
+                current
+            }
+        val playState = track.playState
         Log.i(TAG, "📞 AudioTrack.play() called, playState=$playState (PLAYING=${AudioTrack.PLAYSTATE_PLAYING})")
-        isPlaying.set(true)
         Log.i(TAG, "Playback started successfully, speaker=${audioManager.isSpeakerphoneOn}")
     }
 
@@ -349,22 +368,26 @@ class AudioDevice(
         Log.i(TAG, "Stopping playback")
 
         try {
-            audioTrack?.stop()
-            audioTrack?.release()
-            audioTrack = null
+            synchronized(audioTrackLock) {
+                audioTrack?.stop()
+                audioTrack?.release()
+                audioTrack = null
+            }
 
             // Only reset audio mode if recording is not still active.
             // Both paths depend on MODE_IN_COMMUNICATION for proper routing,
             // AEC, and NS — the last one to stop cleans up.
-            if (!isRecording.get()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    audioManager.clearCommunicationDevice()
-                    Log.i(TAG, "📞 Communication device cleared")
+            synchronized(routingLock) {
+                if (!isRecording.get()) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        audioManager.clearCommunicationDevice()
+                        Log.i(TAG, "📞 Communication device cleared")
+                    }
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    appliedRouteType = null
                 }
-                audioManager.mode = AudioManager.MODE_NORMAL
-                appliedRouteType = null
+                deactivateCallAudioRoutingIfIdle()
             }
-            deactivateCallAudioRoutingIfIdle()
             Log.i(TAG, "Playback stopped (recording still active: ${isRecording.get()})")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping playback", e)
@@ -674,15 +697,17 @@ class AudioDevice(
             audioRecord = null
 
             // Symmetric cleanup: reset audio mode only if playback is not still active.
-            if (!isPlaying.get()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    audioManager.clearCommunicationDevice()
-                    Log.i(TAG, "📞 Communication device cleared")
+            synchronized(routingLock) {
+                if (!isPlaying.get()) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        audioManager.clearCommunicationDevice()
+                        Log.i(TAG, "📞 Communication device cleared")
+                    }
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    appliedRouteType = null
                 }
-                audioManager.mode = AudioManager.MODE_NORMAL
-                appliedRouteType = null
+                deactivateCallAudioRoutingIfIdle()
             }
-            deactivateCallAudioRoutingIfIdle()
             Log.i(TAG, "Recording stopped (playback still active: ${isPlaying.get()})")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping recording", e)
@@ -770,19 +795,21 @@ class AudioDevice(
      */
     @Suppress("DEPRECATION")
     fun enterVoiceCallMode(speakerphone: Boolean) {
-        val previousMode = audioManager.mode
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        speakerphoneOn = speakerphone
-        Log.i(TAG, "📞 Voice call mode: $previousMode -> ${audioManager.mode}")
+        synchronized(routingLock) {
+            val previousMode = audioManager.mode
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            speakerphoneOn = speakerphone
+            Log.i(TAG, "📞 Voice call mode: $previousMode -> ${audioManager.mode}")
 
-        // Log volume levels
-        val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-        Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
+            // Log volume levels
+            val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
 
-        // Apply speaker/headset/earpiece routing and follow device changes during the call
-        activateCallAudioRouting()
-        applyCommunicationRoute(speakerphone)
+            // Apply speaker/headset/earpiece routing and follow device changes during the call
+            activateCallAudioRouting()
+            applyCommunicationRoute(speakerphone)
+        }
     }
 
     /**
@@ -792,16 +819,18 @@ class AudioDevice(
      */
     @Suppress("DEPRECATION")
     fun exitVoiceCallMode() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.clearCommunicationDevice()
+        synchronized(routingLock) {
+            callAudioActive = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+            appliedRouteType = null
+            if (deviceCallbackRegistered.compareAndSet(true, false)) {
+                audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+            }
+            Log.i(TAG, "📞 Exited voice call mode (MODE_NORMAL)")
         }
-        audioManager.mode = AudioManager.MODE_NORMAL
-        appliedRouteType = null
-        callAudioActive = false
-        if (deviceCallbackRegistered.compareAndSet(true, false)) {
-            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
-        }
-        Log.i(TAG, "📞 Exited voice call mode (MODE_NORMAL)")
     }
 
     // ===== Audio Routing (called from Python) =====
@@ -818,25 +847,27 @@ class AudioDevice(
         speakerphoneOn = enabled
         Log.i(TAG, "📞 setSpeakerphoneOn($enabled)")
 
-        applyCommunicationRoute(enabled)
+        synchronized(routingLock) {
+            applyCommunicationRoute(enabled)
 
-        // Recreate AudioTrack to pick up new routing. Many HALs (Samsung Fold3,
-        // some Pixels) don't dynamically re-route an already-playing AudioTrack
-        // when setCommunicationDevice() changes. A fresh AudioTrack inherits the
-        // current routing state from the system at creation time.
-        if (isPlaying.get()) {
-            restartAudioTrack()
-        }
+            // Recreate AudioTrack to pick up new routing. Many HALs (Samsung Fold3,
+            // some Pixels) don't dynamically re-route an already-playing AudioTrack
+            // when setCommunicationDevice() changes. A fresh AudioTrack inherits the
+            // current routing state from the system at creation time.
+            if (isPlaying.get()) {
+                restartAudioTrack()
+            }
 
-        // Restart native Oboe stream for voice call audio (OboeLineSink).
-        // Oboe streams bind to a hardware device at open time and don't follow
-        // system routing changes — must close and reopen to pick up new routing.
-        // Don't gate on isPlaying() — restartStream() handles the not-created
-        // case internally, and gating here prevents recovery if the stream died.
-        try {
-            NativePlaybackEngine.restartStream()
-        } catch (_: UnsatisfiedLinkError) {
-            // Native library not loaded — no Oboe stream to restart
+            // Restart native Oboe stream for voice call audio (OboeLineSink).
+            // Oboe streams bind to a hardware device at open time and don't follow
+            // system routing changes — must close and reopen to pick up new routing.
+            // Don't gate on isPlaying() — restartStream() handles the not-created
+            // case internally, and gating here prevents recovery if the stream died.
+            try {
+                NativePlaybackEngine.restartStream()
+            } catch (_: UnsatisfiedLinkError) {
+                // Native library not loaded — no Oboe stream to restart
+            }
         }
     }
 
@@ -848,73 +879,88 @@ class AudioDevice(
      * a user-initiated speaker toggle.
      */
     private fun restartAudioTrack() {
-        try {
-            val channelConfig =
-                if (playbackChannels == 1) {
-                    AudioFormat.CHANNEL_OUT_MONO
-                } else {
-                    AudioFormat.CHANNEL_OUT_STEREO
-                }
-
-            val bufferSize =
-                AudioTrack.getMinBufferSize(
-                    playbackSampleRate,
-                    channelConfig,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                )
-
-            if (bufferSize <= 0) {
-                Log.e(TAG, "📞 restartAudioTrack: invalid buffer size $bufferSize")
+        synchronized(audioTrackLock) {
+            if (!isPlaying.get()) {
+                Log.i(TAG, "📞 restartAudioTrack skipped: playback stopped")
                 return
             }
+            try {
+                val channelConfig =
+                    if (playbackChannels == 1) {
+                        AudioFormat.CHANNEL_OUT_MONO
+                    } else {
+                        AudioFormat.CHANNEL_OUT_STEREO
+                    }
 
-            val attributes =
-                AudioAttributes
-                    .Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
+                val bufferSize =
+                    AudioTrack.getMinBufferSize(
+                        playbackSampleRate,
+                        channelConfig,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                    )
 
-            val format =
-                AudioFormat
-                    .Builder()
-                    .setSampleRate(playbackSampleRate)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(channelConfig)
-                    .build()
+                if (bufferSize <= 0) {
+                    Log.e(TAG, "📞 restartAudioTrack: invalid buffer size $bufferSize")
+                    return
+                }
 
-            val trackBuilder =
-                AudioTrack
-                    .Builder()
-                    .setAudioAttributes(attributes)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(maxOf(bufferSize * 2, playbackSampleRate * playbackChannels * 2 * 500 / 1000))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
+                val attributes =
+                    AudioAttributes
+                        .Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
 
-            if (playbackLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                val format =
+                    AudioFormat
+                        .Builder()
+                        .setSampleRate(playbackSampleRate)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(channelConfig)
+                        .build()
+
+                val trackBuilder =
+                    AudioTrack
+                        .Builder()
+                        .setAudioAttributes(attributes)
+                        .setAudioFormat(format)
+                        .setBufferSizeInBytes(maxOf(bufferSize * 2, playbackSampleRate * playbackChannels * 2 * 500 / 1000))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+
+                if (playbackLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                }
+
+                val newTrack = trackBuilder.build()
+
+                // Teardown may have set isPlaying=false while the track was being built;
+                // never publish a playing track after the call ended.
+                if (!isPlaying.get()) {
+                    newTrack.release()
+                    Log.i(TAG, "📞 restartAudioTrack aborted: playback stopped while building")
+                    return
+                }
+                newTrack.play()
+
+                // Swap reference — concurrent writeAudio() calls will pick up the new track
+                val oldTrack = audioTrack
+                audioTrack = newTrack
+
+                // Release old track; if a concurrent writeAudio() is mid-write on it,
+                // the try/catch in writeAudio() handles the resulting error gracefully.
+                oldTrack?.stop()
+                oldTrack?.release()
+
+                Log.i(TAG, "📞 AudioTrack restarted for routing change (rate=$playbackSampleRate, ch=$playbackChannels)")
+            } catch (e: Exception) {
+                Log.e(TAG, "📞 Failed to restart AudioTrack for routing change", e)
             }
-
-            val newTrack = trackBuilder.build()
-            newTrack.play()
-
-            // Swap reference — concurrent writeAudio() calls will pick up the new track
-            val oldTrack = audioTrack
-            audioTrack = newTrack
-
-            // Release old track; if a concurrent writeAudio() is mid-write on it,
-            // the try/catch in writeAudio() handles the resulting error gracefully.
-            oldTrack?.stop()
-            oldTrack?.release()
-
-            Log.i(TAG, "📞 AudioTrack restarted for routing change (rate=$playbackSampleRate, ch=$playbackChannels)")
-        } catch (e: Exception) {
-            Log.e(TAG, "📞 Failed to restart AudioTrack for routing change", e)
         }
     }
 
     /**
-     * Apply call-audio routing (speaker, headset, or earpiece).
+     * Apply call-audio routing (speaker, headset, or earpiece). Callers must hold
+     * [routingLock] so routing cannot interleave with teardown.
      *
      * Android 12+: select a communication device explicitly. A connected headset
      * (Bluetooth SCO, wired, USB) takes priority over the builtin earpiece when the
@@ -990,12 +1036,14 @@ class AudioDevice(
      * Only restart the audio streams when the intended route actually changes.
      */
     internal fun onCallAudioDevicesChanged() {
-        if (!callAudioActive) return
-        val previousRouteType = appliedRouteType
-        applyCommunicationRoute(speakerphoneOn)
-        if (previousRouteType != appliedRouteType) {
-            Log.i(TAG, "📞 Call route changed ($previousRouteType -> $appliedRouteType); restarting audio streams")
-            restartCallAudioStreams()
+        synchronized(routingLock) {
+            if (!callAudioActive) return
+            val previousRouteType = appliedRouteType
+            applyCommunicationRoute(speakerphoneOn)
+            if (previousRouteType != appliedRouteType) {
+                Log.i(TAG, "📞 Call route changed ($previousRouteType -> $appliedRouteType); restarting audio streams")
+                restartCallAudioStreams()
+            }
         }
     }
 
@@ -1203,9 +1251,11 @@ class AudioDevice(
         Log.i(TAG, "Shutting down audio bridge")
         stopPlayback()
         stopRecording()
-        callAudioActive = false
-        if (deviceCallbackRegistered.compareAndSet(true, false)) {
-            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+        synchronized(routingLock) {
+            callAudioActive = false
+            if (deviceCallbackRegistered.compareAndSet(true, false)) {
+                audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+            }
         }
         scope.cancel()
     }
