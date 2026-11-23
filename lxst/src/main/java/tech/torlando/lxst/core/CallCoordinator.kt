@@ -72,6 +72,19 @@ interface CallController {
     fun muteMicrophone(muted: Boolean)
 
     fun setSpeaker(enabled: Boolean)
+
+    /**
+     * Output devices selectable for call audio (in-call picker). Backends that
+     * own an [AudioDevice] override this; the default keeps existing test and
+     * transport fakes source-compatible.
+     */
+    fun availableCallAudioDevices(): List<CallAudioDevice> = emptyList()
+
+    /** Route call audio to [deviceId]; false when unavailable or unsupported. */
+    fun selectCallAudioDevice(deviceId: Int): Boolean = false
+
+    /** Id of the device call audio is currently routed to, or null. */
+    fun currentCallAudioDeviceId(): Int? = null
 }
 
 /**
@@ -426,6 +439,25 @@ class CallCoordinator private constructor(
             }
         }
     }
+
+    /**
+     * Output devices selectable for call audio (in-call picker). Empty when no
+     * transport controller is attached yet or the platform only has the
+     * automatic routes.
+     */
+    fun availableCallAudioDevices(): List<CallAudioDevice> =
+        callController?.availableCallAudioDevices().orEmpty()
+
+    /**
+     * Route call audio to [deviceId] from [availableCallAudioDevices].
+     *
+     * @return true when the platform accepted the selection
+     */
+    fun selectCallAudioDevice(deviceId: Int): Boolean =
+        callController?.selectCallAudioDevice(deviceId) ?: false
+
+    /** Id of the device call audio is currently routed to, or null. */
+    fun currentCallAudioDeviceId(): Int? = callController?.currentCallAudioDeviceId()
 
     // ===== Push-to-Talk =====
 
