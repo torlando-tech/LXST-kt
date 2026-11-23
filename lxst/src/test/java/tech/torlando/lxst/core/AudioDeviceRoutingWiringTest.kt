@@ -9,7 +9,9 @@ import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import androidx.test.core.app.ApplicationProvider
+import io.mockk.Runs
 import io.mockk.every
+import io.mockk.just
 import io.mockk.mockk
 import io.mockk.verify
 import org.junit.After
@@ -53,10 +55,16 @@ class AudioDeviceRoutingWiringTest {
         audioBridge = AudioDevice(context, audioManager)
 
         every { audioManager.communicationDevice } returns earpieceInfo
+        every { audioManager.mode } returns AudioManager.MODE_NORMAL
+        every { audioManager.mode = any() } just Runs
+        every { audioManager.getStreamVolume(any()) } returns 0
+        every { audioManager.getStreamMaxVolume(any()) } returns 0
         every { audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS) } returns
             arrayOf(earpieceInfo, speakerInfo)
         every { audioManager.setCommunicationDevice(any()) } returns true
         every { audioManager.clearCommunicationDevice() } returns Unit
+        every { audioManager.registerAudioDeviceCallback(any(), any()) } returns Unit
+        every { audioManager.unregisterAudioDeviceCallback(any()) } returns Unit
     }
 
     @After
@@ -94,5 +102,33 @@ class AudioDeviceRoutingWiringTest {
         audioBridge.setSpeakerphoneOn(false)
 
         verify(exactly = 1) { audioManager.setCommunicationDevice(earpieceInfo) }
+    }
+
+    @Test
+    fun `headset connected mid-call moves call audio to it`() {
+        every { audioManager.availableCommunicationDevices } returns listOf(earpieceInfo, speakerInfo)
+        audioBridge.enterVoiceCallMode(speakerphone = false)
+        verify(exactly = 1) { audioManager.setCommunicationDevice(earpieceInfo) }
+
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+        audioBridge.onCallAudioDevicesChanged()
+
+        verify(exactly = 1) { audioManager.setCommunicationDevice(btScoInfo) }
+        audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
+    fun `headset connected mid-call leaves speaker routing alone`() {
+        every { audioManager.availableCommunicationDevices } returns listOf(earpieceInfo, speakerInfo)
+        audioBridge.enterVoiceCallMode(speakerphone = true)
+
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo, btScoInfo)
+        audioBridge.onCallAudioDevicesChanged()
+
+        verify(exactly = 2) { audioManager.setCommunicationDevice(speakerInfo) }
+        verify(exactly = 0) { audioManager.setCommunicationDevice(btScoInfo) }
+        audioBridge.exitVoiceCallMode()
     }
 }

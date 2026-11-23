@@ -6,7 +6,6 @@ package tech.torlando.lxst.core
 
 import android.media.AudioDeviceInfo
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
@@ -20,7 +19,6 @@ class CallAudioRoutingTest {
     private val wiredHeadset = AudioDeviceInfo.TYPE_WIRED_HEADSET
     private val wiredHeadphones = AudioDeviceInfo.TYPE_WIRED_HEADPHONES
     private val usbHeadset = AudioDeviceInfo.TYPE_USB_HEADSET
-    private val builtinMic = AudioDeviceInfo.TYPE_BUILTIN_MIC
 
     // ===== Output routing =====
 
@@ -99,53 +97,5 @@ class CallAudioRoutingTest {
         val route = CallAudioRouting.resolve(true, listOf(earpiece), listOf(earpiece))
 
         assertEquals(CallAudioRoute.LegacyFallback, route)
-    }
-
-    // ===== Capture routing =====
-
-    @Test
-    fun `bluetooth SCO source is preferred for capture`() {
-        val type = CallAudioRouting.preferredInputType(false, btSco, listOf(builtinMic, btSco))
-
-        assertEquals(btSco, type)
-    }
-
-    @Test
-    fun `wired headset mic is preferred for capture on Android 12+`() {
-        val type = CallAudioRouting.preferredInputType(false, wiredHeadset, listOf(builtinMic, wiredHeadset))
-
-        assertEquals(wiredHeadset, type)
-    }
-
-    @Test
-    fun `wired headset mic is preferred below Android 12 when speaker is off`() {
-        val type = CallAudioRouting.preferredInputType(false, null, listOf(builtinMic, wiredHeadset))
-
-        assertEquals(wiredHeadset, type)
-    }
-
-    @Test
-    fun `builtin mic is used for earpiece and speaker routes`() {
-        assertEquals(
-            builtinMic,
-            CallAudioRouting.preferredInputType(false, earpiece, listOf(builtinMic)),
-        )
-        assertEquals(
-            builtinMic,
-            CallAudioRouting.preferredInputType(true, speaker, listOf(builtinMic)),
-        )
-    }
-
-    @Test
-    fun `output-only headset keeps the builtin mic`() {
-        // Wired headphones expose no matching source, so capture stays on the builtin mic.
-        val type = CallAudioRouting.preferredInputType(false, wiredHeadphones, listOf(builtinMic))
-
-        assertEquals(builtinMic, type)
-    }
-
-    @Test
-    fun `null when no input device is connected`() {
-        assertNull(CallAudioRouting.preferredInputType(false, null, emptyList()))
     }
 }
