@@ -235,6 +235,24 @@ class AudioDeviceRoutingWiringTest {
     }
 
     @Test
+    fun `rejected selection keeps the previous route and preference`() {
+        every { audioManager.availableCommunicationDevices } returns
+            listOf(earpieceInfo, speakerInfo)
+        every { audioManager.setCommunicationDevice(speakerInfo) } returns false
+        audioBridge.enterVoiceCallMode(speakerphone = false)
+        verify(exactly = 1) { audioManager.setCommunicationDevice(earpieceInfo) }
+
+        assertFalse(audioBridge.selectCallAudioDevice(2))
+
+        // The rejected speaker pick must not flip the speaker preference, so a
+        // later device change stays on the earpiece instead of retrying it.
+        audioBridge.onCallAudioDevicesChanged()
+        verify(exactly = 1) { audioManager.setCommunicationDevice(speakerInfo) }
+        verify(exactly = 2) { audioManager.setCommunicationDevice(earpieceInfo) }
+        audioBridge.exitVoiceCallMode()
+    }
+
+    @Test
     fun `selecting an unavailable device is rejected`() {
         every { audioManager.availableCommunicationDevices } returns
             listOf(earpieceInfo, speakerInfo)

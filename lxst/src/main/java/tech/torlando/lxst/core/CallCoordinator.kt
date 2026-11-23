@@ -453,8 +453,17 @@ class CallCoordinator private constructor(
      *
      * @return true when the platform accepted the selection
      */
-    fun selectCallAudioDevice(deviceId: Int): Boolean =
-        callController?.selectCallAudioDevice(deviceId) ?: false
+    fun selectCallAudioDevice(deviceId: Int): Boolean {
+        val controller = callController ?: return false
+        val accepted = controller.selectCallAudioDevice(deviceId)
+        if (accepted) {
+            val selected = controller.availableCallAudioDevices().firstOrNull { it.id == deviceId }
+            if (selected != null) {
+                _isSpeakerOn.value = selected.isSpeaker
+            }
+        }
+        return accepted
+    }
 
     /** Id of the device call audio is currently routed to, or null. */
     fun currentCallAudioDeviceId(): Int? = callController?.currentCallAudioDeviceId()

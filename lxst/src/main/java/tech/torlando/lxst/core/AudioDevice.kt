@@ -28,6 +28,7 @@ import tech.torlando.lxst.audio.NativePlaybackEngine
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 // TODO: Future reorganization (Option B) — redistribute core/ classes by domain:
 //   CallCoordinator, CallState → telephone/
@@ -162,6 +163,10 @@ class AudioDevice(
 
     @Volatile
     private var communicationDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
+
+    // Counts listener-driven rebinds so the settle timer does not restart the
+    // same selection a second time.
+    private val routeRebindGeneration = AtomicInteger(0)
 
     private val audioDeviceCallback =
         object : AudioDeviceCallback() {
@@ -954,23 +959,30 @@ class AudioDevice(
                 return false
             }
 
-            userSelectedDeviceId = deviceId
-            speakerphoneOn = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
             val success = audioManager.setCommunicationDevice(device)
-            appliedRouteType = device.type
             Log.i(
                 TAG,
                 "📞 User selected call audio device: ${device.productName} (type=${device.type}) success=$success",
             )
+            if (!success) {
+                // Keep the previous route and selection when the platform rejects
+                // the request instead of retrying it on later device changes.
+                Log.w(TAG, "📞 Keeping previous call audio route; selection was rejected")
+                return false
+            }
+
+            userSelectedDeviceId = deviceId
+            speakerphoneOn = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            appliedRouteType = device.type
             if (audioManager.communicationDevice?.id == deviceId) {
                 // Route already active (re-selecting the current device): rebind now.
                 restartCallAudioStreams()
             } else {
                 // The switch is asynchronous; rebinding now would target the
                 // previous route and can leave the call silent.
-                scheduleRouteSettledRebind(device)
+                scheduleRouteSettledRebind(device, routeRebindGeneration.get())
             }
-            return success
+            return true
         }
     }
 
@@ -981,14 +993,18 @@ class AudioDevice(
      * applied it (seen on some Bluetooth stacks), so the user does not have to
      * select the same device twice to get audio.
      */
-    private fun scheduleRouteSettledRebind(device: AudioDeviceInfo) {
+    private fun scheduleRouteSettledRebind(device: AudioDeviceInfo, selectionGeneration: Int) {
         val deviceId = device.id
         scope.launch {
             delay(ROUTE_SETTLE_DELAY_MS)
             synchronized(routingLock) {
                 if (!callAudioActive || userSelectedDeviceId != deviceId) return@launch
-                Log.i(TAG, "📞 Rebinding call audio streams after route change")
-                restartCallAudioStreams()
+                // The change listener already rebound on the new route; a second
+                // restart would cut working audio for no reason.
+                if (routeRebindGeneration.get() == selectionGeneration) {
+                    Log.i(TAG, "📞 Rebinding call audio streams after route change")
+                    restartCallAudioStreams()
+                }
                 if (audioManager.communicationDevice?.id == deviceId) return@launch
             }
             delay(ROUTE_CONFIRM_TIMEOUT_MS)
@@ -1268,6 +1284,7 @@ class AudioDevice(
             if (!callAudioActive) return
             Log.i(TAG, "📞 Rebinding call audio streams for the new communication device")
             restartCallAudioStreams()
+            routeRebindGeneration.incrementAndGet()
         }
     }
 
