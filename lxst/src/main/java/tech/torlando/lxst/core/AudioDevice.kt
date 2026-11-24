@@ -7,6 +7,7 @@ package tech.torlando.lxst.core
 import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -14,16 +15,20 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import tech.torlando.lxst.audio.NativePlaybackEngine
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 // TODO: Future reorganization (Option B) — redistribute core/ classes by domain:
 //   CallCoordinator, CallState → telephone/
@@ -64,6 +69,12 @@ class AudioDevice(
         const val DEFAULT_FRAME_SIZE_MS = 20 // 20ms frames
         const val BUFFER_QUEUE_SIZE = 20 // Number of audio frames to buffer (increased for smoother playback)
 
+        // Communication-device switches resolve asynchronously; give the
+        // platform time to apply the route before rebinding, and a bounded
+        // window to confirm it before retrying once.
+        private const val ROUTE_SETTLE_DELAY_MS = 1500L
+        private const val ROUTE_CONFIRM_TIMEOUT_MS = 1500L
+
         @Volatile
         private var instance: AudioDevice? = null
 
@@ -93,6 +104,14 @@ class AudioDevice(
     private var audioTrack: AudioTrack? = null
     private val isPlaying = AtomicBoolean(false)
 
+    // Serializes AudioTrack replacement with teardown: a device-change restart that races
+    // hangup must never publish a playing track after stopPlayback() released the old one.
+    private val audioTrackLock = Any()
+
+    // Serializes communication-device routing with teardown, so a device-change callback
+    // that already passed the call-active check cannot re-select a device after hangup.
+    private val routingLock = Any()
+
     @Volatile
     private var playbackSampleRate = DEFAULT_SAMPLE_RATE
 
@@ -119,6 +138,48 @@ class AudioDevice(
     // Audio routing
     @Volatile
     private var speakerphoneOn = false // Default to earpiece
+
+    // Output device the user explicitly picked in the in-call audio picker.
+    // Null = automatic policy (speaker on/off, headset preference). Survives
+    // device add/remove while the chosen device remains available.
+    @Volatile
+    private var userSelectedDeviceId: Int? = null
+
+    // Output type of the last applied communication-device route (null = platform default
+    // or legacy speakerphone). Used to decide whether a device add/remove changes routing.
+    @Volatile
+    private var appliedRouteType: Int? = null
+
+    // True while call audio is running, so plugging in a headset reroutes it mid-call.
+    @Volatile
+    private var callAudioActive = false
+
+    private val deviceCallbackRegistered = AtomicBoolean(false)
+
+    // Route changes land asynchronously after setCommunicationDevice(); this
+    // listener rebinds the playback streams once the platform actually switched,
+    // instead of rebinding against the old route and leaving silence.
+    private val communicationDeviceCallbackRegistered = AtomicBoolean(false)
+
+    @Volatile
+    private var communicationDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
+
+    // Counts listener-driven rebinds so the settle timer does not restart the
+    // same selection a second time.
+    private val routeRebindGeneration = AtomicInteger(0)
+
+    private val audioDeviceCallback =
+        object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                Log.i(TAG, "📞 Audio devices added: ${addedDevices.map { "${it.type}:${it.productName}" }}")
+                onCallAudioDevicesChanged()
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                Log.i(TAG, "📞 Audio devices removed: ${removedDevices.map { "${it.type}:${it.productName}" }}")
+                onCallAudioDevicesChanged()
+            }
+        }
 
     @Volatile
     private var microphoneMuted = false
@@ -229,7 +290,7 @@ class AudioDevice(
                 trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             }
 
-            audioTrack = trackBuilder.build()
+            audioTrack = synchronized(audioTrackLock) { trackBuilder.build() }
 
             // Log AudioTrack state
             val track = audioTrack
@@ -248,13 +309,10 @@ class AudioDevice(
             val maxVol = audioManager.getStreamMaxVolume(streamVoiceCall)
             Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
 
-            // Apply audio routing using modern API on Android 12+
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                setCommunicationDeviceByType(speakerphoneOn)
-            } else {
-                @Suppress("DEPRECATION")
-                audioManager.isSpeakerphoneOn = speakerphoneOn
-                Log.i(TAG, "📞 Legacy speakerphone set to: ${audioManager.isSpeakerphoneOn}")
+            // Apply audio routing (headset-aware on Android 12+, legacy speakerphone below)
+            synchronized(routingLock) {
+                activateCallAudioRouting()
+                applyCommunicationRoute(speakerphoneOn)
             }
 
             // Log available output devices
@@ -280,10 +338,19 @@ class AudioDevice(
      * so playback starts with a full prebuffer — no race with DMA consumption.
      */
     fun beginPlayback() {
-        audioTrack?.play()
-        val playState = audioTrack?.playState
+        val track =
+            synchronized(audioTrackLock) {
+                val current = audioTrack
+                if (current == null) {
+                    Log.w(TAG, "📞 beginPlayback: no AudioTrack (playback torn down)")
+                    return
+                }
+                current.play()
+                isPlaying.set(true)
+                current
+            }
+        val playState = track.playState
         Log.i(TAG, "📞 AudioTrack.play() called, playState=$playState (PLAYING=${AudioTrack.PLAYSTATE_PLAYING})")
-        isPlaying.set(true)
         Log.i(TAG, "Playback started successfully, speaker=${audioManager.isSpeakerphoneOn}")
     }
 
@@ -327,19 +394,25 @@ class AudioDevice(
         Log.i(TAG, "Stopping playback")
 
         try {
-            audioTrack?.stop()
-            audioTrack?.release()
-            audioTrack = null
+            synchronized(audioTrackLock) {
+                audioTrack?.stop()
+                audioTrack?.release()
+                audioTrack = null
+            }
 
             // Only reset audio mode if recording is not still active.
             // Both paths depend on MODE_IN_COMMUNICATION for proper routing,
             // AEC, and NS — the last one to stop cleans up.
-            if (!isRecording.get()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    audioManager.clearCommunicationDevice()
-                    Log.i(TAG, "📞 Communication device cleared")
+            synchronized(routingLock) {
+                if (!isRecording.get()) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        audioManager.clearCommunicationDevice()
+                        Log.i(TAG, "📞 Communication device cleared")
+                    }
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    appliedRouteType = null
                 }
-                audioManager.mode = AudioManager.MODE_NORMAL
+                deactivateCallAudioRoutingIfIdle()
             }
             Log.i(TAG, "Playback stopped (recording still active: ${isRecording.get()})")
         } catch (e: Exception) {
@@ -382,7 +455,7 @@ class AudioDevice(
             ensureAudioModeForRecording()
             val record = createAudioRecord(sampleRate, channelConfig, minBufferSize, samplesPerFrame, channels) ?: return
             audioRecord = record
-            configurePreferredInputDevice(record)
+            activateCallAudioRouting()
             startRecordingAndLaunchLoop(record)
             Log.i(TAG, "Recording started successfully")
         } catch (e: Exception) {
@@ -447,20 +520,6 @@ class AudioDevice(
             return null
         }
         return record
-    }
-
-    /** On Android 6+, set preferred input device to built-in mic. */
-    private fun configurePreferredInputDevice(record: AudioRecord) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            val builtinMic = inputDevices.find { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-            if (builtinMic != null) {
-                val success = record.setPreferredDevice(builtinMic)
-                Log.i(TAG, "📞 Set preferred input device to ${builtinMic.productName}: $success")
-            } else {
-                Log.w(TAG, "📞 No built-in mic found in ${inputDevices.map { "${it.type}:${it.productName}" }}")
-            }
-        }
     }
 
     /** Start the AudioRecord and launch the recording loop coroutine. */
@@ -664,12 +723,16 @@ class AudioDevice(
             audioRecord = null
 
             // Symmetric cleanup: reset audio mode only if playback is not still active.
-            if (!isPlaying.get()) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    audioManager.clearCommunicationDevice()
-                    Log.i(TAG, "📞 Communication device cleared")
+            synchronized(routingLock) {
+                if (!isPlaying.get()) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        audioManager.clearCommunicationDevice()
+                        Log.i(TAG, "📞 Communication device cleared")
+                    }
+                    audioManager.mode = AudioManager.MODE_NORMAL
+                    appliedRouteType = null
                 }
-                audioManager.mode = AudioManager.MODE_NORMAL
+                deactivateCallAudioRoutingIfIdle()
             }
             Log.i(TAG, "Recording stopped (playback still active: ${isPlaying.get()})")
         } catch (e: Exception) {
@@ -758,21 +821,21 @@ class AudioDevice(
      */
     @Suppress("DEPRECATION")
     fun enterVoiceCallMode(speakerphone: Boolean) {
-        val previousMode = audioManager.mode
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        speakerphoneOn = speakerphone
-        Log.i(TAG, "📞 Voice call mode: $previousMode -> ${audioManager.mode}")
+        synchronized(routingLock) {
+            val previousMode = audioManager.mode
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            speakerphoneOn = speakerphone
+            userSelectedDeviceId = null
+            Log.i(TAG, "📞 Voice call mode: $previousMode -> ${audioManager.mode}")
 
-        // Log volume levels
-        val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-        Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
+            // Log volume levels
+            val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            Log.i(TAG, "📞 Voice call volume: $currentVol / $maxVol")
 
-        // Apply speaker/earpiece routing
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            setCommunicationDeviceByType(speakerphone)
-        } else {
-            audioManager.isSpeakerphoneOn = speakerphone
+            // Apply speaker/headset/earpiece routing and follow device changes during the call
+            activateCallAudioRouting()
+            applyCommunicationRoute(speakerphone)
         }
     }
 
@@ -783,11 +846,20 @@ class AudioDevice(
      */
     @Suppress("DEPRECATION")
     fun exitVoiceCallMode() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.clearCommunicationDevice()
+        synchronized(routingLock) {
+            callAudioActive = false
+            userSelectedDeviceId = null
+            unregisterCommunicationDeviceListener()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+            appliedRouteType = null
+            if (deviceCallbackRegistered.compareAndSet(true, false)) {
+                audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+            }
+            Log.i(TAG, "📞 Exited voice call mode (MODE_NORMAL)")
         }
-        audioManager.mode = AudioManager.MODE_NORMAL
-        Log.i(TAG, "📞 Exited voice call mode (MODE_NORMAL)")
     }
 
     // ===== Audio Routing (called from Python) =====
@@ -801,37 +873,168 @@ class AudioDevice(
      */
     @Suppress("DEPRECATION")
     fun setSpeakerphoneOn(enabled: Boolean) {
-        speakerphoneOn = enabled
-        Log.i(TAG, "📞 setSpeakerphoneOn($enabled)")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12+: Use modern setCommunicationDevice API
-            setCommunicationDeviceByType(enabled)
-        } else {
-            // Legacy API for older Android versions
-            audioManager.isSpeakerphoneOn = enabled
-            Log.d(TAG, "📞 Legacy speakerphone set: $enabled")
-        }
-
-        // Recreate AudioTrack to pick up new routing. Many HALs (Samsung Fold3,
-        // some Pixels) don't dynamically re-route an already-playing AudioTrack
-        // when setCommunicationDevice() changes. A fresh AudioTrack inherits the
-        // current routing state from the system at creation time.
-        if (isPlaying.get()) {
-            restartAudioTrack()
-        }
-
-        // Restart native Oboe stream for voice call audio (OboeLineSink).
-        // Oboe streams bind to a hardware device at open time and don't follow
-        // system routing changes — must close and reopen to pick up new routing.
-        // Don't gate on isPlaying() — restartStream() handles the not-created
-        // case internally, and gating here prevents recovery if the stream died.
-        try {
-            NativePlaybackEngine.restartStream()
-        } catch (_: UnsatisfiedLinkError) {
-            // Native library not loaded — no Oboe stream to restart
+        synchronized(routingLock) {
+            speakerphoneOn = enabled
+            // The legacy speaker toggle is the automatic path; an explicit picker
+            // selection must not silently override the user's tap.
+            userSelectedDeviceId = null
+            Log.i(TAG, "📞 setSpeakerphoneOn($enabled)")
+            applyCommunicationRoute(enabled)
+            restartCallAudioStreams()
         }
     }
+
+    // ===== Call audio device picker (in-call output selection) =====
+
+    /**
+     * Output devices the platform offers for call audio, in the order to show
+     * them. Android 12+ uses [AudioManager.getAvailableCommunicationDevices],
+     * the set `setCommunicationDevice()` accepts — builtin earpiece/speaker,
+     * Bluetooth SCO/LE, hearing aids, wired and USB headsets. Output-only
+     * devices (e.g. wired headphones without a mic) are not selectable and
+     * therefore not listed; platform routing still sends call audio to them
+     * while automatic routing is active.
+     *
+     * Below Android 12 only earpiece and speaker can be chosen explicitly; the
+     * ids are the builtin [AudioDeviceInfo] types because there is no
+     * selectable-device collection to take ids from.
+     */
+    fun availableCallAudioDevices(): List<CallAudioDevice> =
+        synchronized(routingLock) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.availableCommunicationDevices.map { device ->
+                    CallAudioDevice(
+                        id = device.id,
+                        type = device.type,
+                        name = device.productName?.toString().orEmpty(),
+                    )
+                }
+            } else {
+                listOf(
+                    CallAudioDevice(
+                        id = AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
+                        type = AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
+                        name = "Earpiece",
+                    ),
+                    CallAudioDevice(
+                        id = AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+                        type = AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+                        name = "Speaker",
+                    ),
+                )
+            }
+        }
+
+    /**
+     * Route call audio to [deviceId], one of [availableCallAudioDevices].
+     *
+     * The choice survives device add/remove while that device stays available;
+     * once it disappears the automatic policy (speaker toggle, headset
+     * preference) takes over. Toggling the speaker with [setSpeakerphoneOn]
+     * cancels the explicit choice. Playback streams are restarted so already
+     * playing AudioTracks/Oboe streams move to the new device.
+     *
+     * @return true when the platform accepted the selection (or the legacy
+     *   speaker toggle was applied below Android 12)
+     */
+    @Suppress("DEPRECATION")
+    fun selectCallAudioDevice(deviceId: Int): Boolean {
+        synchronized(routingLock) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                // Legacy platform: the only explicit routes are earpiece/speaker.
+                if (deviceId != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE && deviceId != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    Log.w(TAG, "📞 selectCallAudioDevice($deviceId): not a legacy route")
+                    return false
+                }
+                speakerphoneOn = deviceId == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                userSelectedDeviceId = null
+                applyCommunicationRoute(speakerphoneOn)
+                restartCallAudioStreams()
+                return true
+            }
+
+            val device = audioManager.availableCommunicationDevices.firstOrNull { it.id == deviceId }
+            if (device == null) {
+                Log.w(TAG, "📞 selectCallAudioDevice($deviceId): no longer available")
+                return false
+            }
+
+            val success = audioManager.setCommunicationDevice(device)
+            Log.i(
+                TAG,
+                "📞 User selected call audio device: ${device.productName} (type=${device.type}) success=$success",
+            )
+            if (!success) {
+                // Keep the previous route and selection when the platform rejects
+                // the request instead of retrying it on later device changes.
+                Log.w(TAG, "📞 Keeping previous call audio route; selection was rejected")
+                return false
+            }
+
+            userSelectedDeviceId = deviceId
+            speakerphoneOn = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            appliedRouteType = device.type
+            if (audioManager.communicationDevice?.id == deviceId) {
+                // Route already active (re-selecting the current device): rebind now.
+                restartCallAudioStreams()
+            } else {
+                // The switch is asynchronous; rebinding now would target the
+                // previous route and can leave the call silent.
+                scheduleRouteSettledRebind(device, routeRebindGeneration.get())
+            }
+            return true
+        }
+    }
+
+    /**
+     * `setCommunicationDevice()` is asynchronous: rebinding immediately targets
+     * the previous route and can leave silence on the new one. Rebind again once
+     * the route has settled, and retry the request once if the platform never
+     * applied it (seen on some Bluetooth stacks), so the user does not have to
+     * select the same device twice to get audio.
+     */
+    private fun scheduleRouteSettledRebind(device: AudioDeviceInfo, selectionGeneration: Int) {
+        val deviceId = device.id
+        scope.launch {
+            delay(ROUTE_SETTLE_DELAY_MS)
+            synchronized(routingLock) {
+                if (!callAudioActive || userSelectedDeviceId != deviceId) return@launch
+                // The change listener already rebound on the new route; a second
+                // restart would cut working audio for no reason.
+                if (routeRebindGeneration.get() == selectionGeneration) {
+                    Log.i(TAG, "📞 Rebinding call audio streams after route change")
+                    restartCallAudioStreams()
+                }
+                if (audioManager.communicationDevice?.id == deviceId) return@launch
+            }
+            delay(ROUTE_CONFIRM_TIMEOUT_MS)
+            synchronized(routingLock) {
+                if (!callAudioActive || userSelectedDeviceId != deviceId) return@launch
+                if (audioManager.communicationDevice?.id == deviceId) return@launch
+                Log.w(TAG, "📞 Route to device $deviceId did not take; retrying after clear")
+                audioManager.clearCommunicationDevice()
+                audioManager.setCommunicationDevice(device)
+            }
+        }
+    }
+
+    /**
+     * Id of the device call audio is currently routed to, or null when the
+     * platform reports none. On Android 12+ this is the active communication
+     * device, which reflects the platform's own routing (automatic selection,
+     * device removal fallback) rather than what was last requested.
+     */
+    @Suppress("DEPRECATION")
+    fun currentCallAudioDeviceId(): Int? =
+        synchronized(routingLock) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.communicationDevice?.id
+            } else if (audioManager.isSpeakerphoneOn) {
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            } else {
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            }
+        }
 
     /**
      * Recreate the AudioTrack to pick up changed audio routing.
@@ -841,111 +1044,257 @@ class AudioDevice(
      * a user-initiated speaker toggle.
      */
     private fun restartAudioTrack() {
-        try {
-            val channelConfig =
-                if (playbackChannels == 1) {
-                    AudioFormat.CHANNEL_OUT_MONO
-                } else {
-                    AudioFormat.CHANNEL_OUT_STEREO
-                }
-
-            val bufferSize =
-                AudioTrack.getMinBufferSize(
-                    playbackSampleRate,
-                    channelConfig,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                )
-
-            if (bufferSize <= 0) {
-                Log.e(TAG, "📞 restartAudioTrack: invalid buffer size $bufferSize")
+        synchronized(audioTrackLock) {
+            if (!isPlaying.get()) {
+                Log.i(TAG, "📞 restartAudioTrack skipped: playback stopped")
                 return
             }
+            try {
+                val channelConfig =
+                    if (playbackChannels == 1) {
+                        AudioFormat.CHANNEL_OUT_MONO
+                    } else {
+                        AudioFormat.CHANNEL_OUT_STEREO
+                    }
 
-            val attributes =
-                AudioAttributes
-                    .Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
+                val bufferSize =
+                    AudioTrack.getMinBufferSize(
+                        playbackSampleRate,
+                        channelConfig,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                    )
 
-            val format =
-                AudioFormat
-                    .Builder()
-                    .setSampleRate(playbackSampleRate)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(channelConfig)
-                    .build()
+                if (bufferSize <= 0) {
+                    Log.e(TAG, "📞 restartAudioTrack: invalid buffer size $bufferSize")
+                    return
+                }
 
-            val trackBuilder =
-                AudioTrack
-                    .Builder()
-                    .setAudioAttributes(attributes)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(maxOf(bufferSize * 2, playbackSampleRate * playbackChannels * 2 * 500 / 1000))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
+                val attributes =
+                    AudioAttributes
+                        .Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
 
-            if (playbackLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                val format =
+                    AudioFormat
+                        .Builder()
+                        .setSampleRate(playbackSampleRate)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(channelConfig)
+                        .build()
+
+                val trackBuilder =
+                    AudioTrack
+                        .Builder()
+                        .setAudioAttributes(attributes)
+                        .setAudioFormat(format)
+                        .setBufferSizeInBytes(maxOf(bufferSize * 2, playbackSampleRate * playbackChannels * 2 * 500 / 1000))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+
+                if (playbackLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    trackBuilder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                }
+
+                val newTrack = trackBuilder.build()
+
+                // Teardown may have set isPlaying=false while the track was being built;
+                // never publish a playing track after the call ended.
+                if (!isPlaying.get()) {
+                    newTrack.release()
+                    Log.i(TAG, "📞 restartAudioTrack aborted: playback stopped while building")
+                    return
+                }
+                newTrack.play()
+
+                // Swap reference — concurrent writeAudio() calls will pick up the new track
+                val oldTrack = audioTrack
+                audioTrack = newTrack
+
+                // Release old track; if a concurrent writeAudio() is mid-write on it,
+                // the try/catch in writeAudio() handles the resulting error gracefully.
+                oldTrack?.stop()
+                oldTrack?.release()
+
+                Log.i(TAG, "📞 AudioTrack restarted for routing change (rate=$playbackSampleRate, ch=$playbackChannels)")
+            } catch (e: Exception) {
+                Log.e(TAG, "📞 Failed to restart AudioTrack for routing change", e)
             }
-
-            val newTrack = trackBuilder.build()
-            newTrack.play()
-
-            // Swap reference — concurrent writeAudio() calls will pick up the new track
-            val oldTrack = audioTrack
-            audioTrack = newTrack
-
-            // Release old track; if a concurrent writeAudio() is mid-write on it,
-            // the try/catch in writeAudio() handles the resulting error gracefully.
-            oldTrack?.stop()
-            oldTrack?.release()
-
-            Log.i(TAG, "📞 AudioTrack restarted for routing change (rate=$playbackSampleRate, ch=$playbackChannels)")
-        } catch (e: Exception) {
-            Log.e(TAG, "📞 Failed to restart AudioTrack for routing change", e)
         }
     }
 
     /**
-     * Set communication device by type (Android 12+).
+     * Apply call-audio routing (speaker, headset, or earpiece). Callers must hold
+     * [routingLock] so routing cannot interleave with teardown.
      *
-     * @param useSpeaker True for speaker, false for earpiece
+     * Android 12+: select a communication device explicitly. A connected headset
+     * (Bluetooth SCO, wired, USB) takes priority over the builtin earpiece when the
+     * speaker is off — hard-wiring the earpiece is what kept call audio off headphones.
+     * Output-only headsets that the platform does not expose as selectable
+     * communication devices (e.g. wired headphones without a mic) are handled by
+     * clearing the selection so platform call routing picks them.
+     *
+     * Below Android 12: legacy speakerphone toggle; the platform routes to a connected
+     * headset on its own.
+     *
+     * The input device is not pinned: the platform selects the source matching the
+     * communication device, which is what makes Bluetooth headset mics work.
      */
-    @android.annotation.SuppressLint("NewApi")
-    private fun setCommunicationDeviceByType(useSpeaker: Boolean) {
+    @Suppress("DEPRECATION")
+    private fun applyCommunicationRoute(useSpeaker: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            audioManager.isSpeakerphoneOn = useSpeaker
+            appliedRouteType = null
+            Log.d(TAG, "📞 Legacy speakerphone set: $useSpeaker")
+            return
+        }
+
+        // A device the user picked in the in-call audio picker wins over the
+        // automatic policy until it disappears.
+        val explicitSelection = userSelectedDeviceId
+        if (explicitSelection != null) {
+            val explicitDevice =
+                audioManager.availableCommunicationDevices.firstOrNull { it.id == explicitSelection }
+            if (explicitDevice != null) {
+                val success = audioManager.setCommunicationDevice(explicitDevice)
+                appliedRouteType = explicitDevice.type
+                Log.i(
+                    TAG,
+                    "📞 Selected call audio device: ${explicitDevice.productName} (type=${explicitDevice.type}) success=$success",
+                )
+                return
+            }
+            Log.i(TAG, "📞 Selected call audio device $explicitSelection is gone; returning to automatic routing")
+            userSelectedDeviceId = null
+        }
+
+        var nextRouteType: Int? = null
         try {
             val availableDevices = audioManager.availableCommunicationDevices
-            Log.i(TAG, "📞 Available communication devices: ${availableDevices.map { "${it.type}:${it.productName}" }}")
+            val connectedOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val route =
+                CallAudioRouting.resolve(
+                    speakerOn = useSpeaker,
+                    availableCommunicationTypes = availableDevices.map { it.type },
+                    connectedOutputTypes = connectedOutputs.map { it.type },
+                )
+            Log.i(TAG, "📞 Call route for speaker=$useSpeaker: $route")
 
-            val targetType =
-                if (useSpeaker) {
-                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                } else {
-                    AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            when (route) {
+                is CallAudioRoute.Select -> {
+                    val targetDevice = availableDevices.find { it.type == route.outputType }
+                    if (targetDevice == null) {
+                        audioManager.isSpeakerphoneOn = useSpeaker
+                        Log.w(TAG, "📞 Device type ${route.outputType} unavailable; legacy speakerphone set: $useSpeaker")
+                    } else {
+                        val success = audioManager.setCommunicationDevice(targetDevice)
+                        nextRouteType = route.outputType
+                        Log.i(TAG, "📞 setCommunicationDevice(${targetDevice.productName}, type=${targetDevice.type}): success=$success")
+                    }
                 }
 
-            val targetDevice = availableDevices.find { it.type == targetType }
+                CallAudioRoute.PlatformDefault -> {
+                    audioManager.clearCommunicationDevice()
+                    Log.i(TAG, "📞 Cleared communication device; platform routes call audio (speaker=$useSpeaker)")
+                }
 
-            if (targetDevice != null) {
-                val success = audioManager.setCommunicationDevice(targetDevice)
-                Log.i(TAG, "📞 setCommunicationDevice(${targetDevice.productName}, type=$targetType): success=$success")
-
-                // Verify the change
-                val currentDevice = audioManager.communicationDevice
-                Log.i(TAG, "📞 Current communication device: ${currentDevice?.productName} (type=${currentDevice?.type})")
-            } else {
-                Log.w(TAG, "📞 Target device type $targetType not found in available devices")
-                // Fall back to legacy API
-                @Suppress("DEPRECATION")
-                audioManager.isSpeakerphoneOn = useSpeaker
-                Log.d(TAG, "📞 Fallback to legacy speakerphone: $useSpeaker")
+                CallAudioRoute.LegacyFallback -> {
+                    audioManager.isSpeakerphoneOn = useSpeaker
+                    Log.d(TAG, "📞 Fallback to legacy speakerphone: $useSpeaker")
+                }
             }
+
+            val currentDevice = audioManager.communicationDevice
+            Log.i(TAG, "📞 Current communication device: ${currentDevice?.productName} (type=${currentDevice?.type})")
         } catch (e: Exception) {
             Log.e(TAG, "📞 Error setting communication device", e)
-            // Fall back to legacy API
-            @Suppress("DEPRECATION")
             audioManager.isSpeakerphoneOn = useSpeaker
         }
+        appliedRouteType = nextRouteType
+    }
+
+    /**
+     * Re-evaluate routing when audio devices are added or removed during a call.
+     *
+     * A headset connected mid-call (or a Bluetooth SCO link that finishes connecting
+     * after the route was chosen) must move call audio to it without a speaker toggle.
+     * Only restart the audio streams when the intended route actually changes.
+     */
+    internal fun onCallAudioDevicesChanged() {
+        synchronized(routingLock) {
+            if (!callAudioActive) return
+            val previousRouteType = appliedRouteType
+            applyCommunicationRoute(speakerphoneOn)
+            if (previousRouteType != appliedRouteType) {
+                Log.i(TAG, "📞 Call route changed ($previousRouteType -> $appliedRouteType); restarting audio streams")
+                restartCallAudioStreams()
+            }
+        }
+    }
+
+    /** Bind playback streams to the newly selected route. */
+    private fun restartCallAudioStreams() {
+        if (isPlaying.get()) {
+            restartAudioTrack()
+        }
+        try {
+            NativePlaybackEngine.restartStream()
+        } catch (_: UnsatisfiedLinkError) {
+            // Native library not loaded — no Oboe stream to restart
+        }
+    }
+
+    /** Mark call audio active and start following device availability changes. */
+    private fun activateCallAudioRouting() {
+        callAudioActive = true
+        if (deviceCallbackRegistered.compareAndSet(false, true)) {
+            audioManager.registerAudioDeviceCallback(audioDeviceCallback, Handler(Looper.getMainLooper()))
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            communicationDeviceCallbackRegistered.compareAndSet(false, true)
+        ) {
+            val listener =
+                AudioManager.OnCommunicationDeviceChangedListener { device ->
+                    Log.i(TAG, "📞 Communication device changed: ${device?.productName} (type=${device?.type})")
+                    onCommunicationDeviceChanged()
+                }
+            communicationDeviceListener = listener
+            audioManager.addOnCommunicationDeviceChangedListener(context.mainExecutor, listener)
+        }
+    }
+
+    /** Stop following device changes once neither playback nor capture is active. */
+    private fun deactivateCallAudioRoutingIfIdle() {
+        if (isPlaying.get() || isRecording.get()) return
+        callAudioActive = false
+        if (deviceCallbackRegistered.compareAndSet(true, false)) {
+            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+        }
+        unregisterCommunicationDeviceListener()
+    }
+
+    /**
+     * Rebind playback streams after the platform confirms a new communication
+     * device. `setCommunicationDevice()` resolves asynchronously, so an
+     * immediate rebind can open the stream on the old route and leave the call
+     * silent on the new one.
+     */
+    private fun onCommunicationDeviceChanged() {
+        synchronized(routingLock) {
+            if (!callAudioActive) return
+            Log.i(TAG, "📞 Rebinding call audio streams for the new communication device")
+            restartCallAudioStreams()
+            routeRebindGeneration.incrementAndGet()
+        }
+    }
+
+    private fun unregisterCommunicationDeviceListener() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        val listener = communicationDeviceListener
+        if (communicationDeviceCallbackRegistered.compareAndSet(true, false) && listener != null) {
+            audioManager.removeOnCommunicationDeviceChangedListener(listener)
+        }
+        communicationDeviceListener = null
     }
 
     /**
@@ -1123,6 +1472,97 @@ class AudioDevice(
         Log.i(TAG, "Shutting down audio bridge")
         stopPlayback()
         stopRecording()
+        synchronized(routingLock) {
+            callAudioActive = false
+            unregisterCommunicationDeviceListener()
+            if (deviceCallbackRegistered.compareAndSet(true, false)) {
+                audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
+            }
+        }
         scope.cancel()
+    }
+}
+
+/**
+ * An output device offered for call audio, suitable for an in-call device picker.
+ *
+ * [id] is an `AudioDeviceInfo.id` on Android 12+; below Android 12 it is the
+ * builtin device type, because the platform exposes no selectable-device ids.
+ * [name] is the platform product name; builtin earpiece/speaker names should be
+ * localized by the app UI rather than shown verbatim.
+ */
+data class CallAudioDevice(
+    val id: Int,
+    val type: Int,
+    val name: String,
+) {
+    val isSpeaker: Boolean get() = type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+}
+
+internal sealed interface CallAudioRoute {
+    /** Select the platform communication device with [outputType]. */
+    data class Select(val outputType: Int) : CallAudioRoute
+
+    /** Clear the app's selection: the platform routes to the connected headset or earpiece. */
+    data object PlatformDefault : CallAudioRoute
+
+    /** No selectable device for the request: use the legacy speakerphone API. */
+    data object LegacyFallback : CallAudioRoute
+}
+
+/**
+ * Chooses call-audio routing.
+ *
+ * The bug this exists for: on Android 12+ the bridge pinned every call to
+ * `TYPE_BUILTIN_EARPIECE` (speaker off) or `TYPE_BUILTIN_SPEAKER` (speaker on), so
+ * Bluetooth and wired headsets never received call audio. Headsets must win over the
+ * earpiece while the speaker is off; the speaker toggle still overrides them.
+ */
+@SuppressLint("InlinedApi")
+internal object CallAudioRouting {
+    /** Communication-capable output types, ordered by preference when the speaker is off. */
+    private val HEADSET_OUTPUT_TYPES =
+        listOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_HEARING_AID,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_USB_DEVICE,
+        )
+
+    /**
+     * @param availableCommunicationTypes output types accepted by `setCommunicationDevice()`
+     * @param connectedOutputTypes all currently connected output types
+     */
+    fun resolve(
+        speakerOn: Boolean,
+        availableCommunicationTypes: List<Int>,
+        connectedOutputTypes: List<Int>,
+    ): CallAudioRoute {
+        if (speakerOn) {
+            return if (AudioDeviceInfo.TYPE_BUILTIN_SPEAKER in availableCommunicationTypes) {
+                CallAudioRoute.Select(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+            } else {
+                CallAudioRoute.LegacyFallback
+            }
+        }
+
+        HEADSET_OUTPUT_TYPES
+            .firstOrNull { it in availableCommunicationTypes }
+            ?.let { return CallAudioRoute.Select(it) }
+
+        // Output-only headsets (e.g. wired headphones without a mic) are not selectable
+        // communication devices. Clearing lets the platform's call routing pick them.
+        if (HEADSET_OUTPUT_TYPES.any { it in connectedOutputTypes }) {
+            return CallAudioRoute.PlatformDefault
+        }
+
+        return if (AudioDeviceInfo.TYPE_BUILTIN_EARPIECE in availableCommunicationTypes) {
+            CallAudioRoute.Select(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)
+        } else {
+            CallAudioRoute.PlatformDefault
+        }
     }
 }

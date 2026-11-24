@@ -8,6 +8,7 @@
 
 package tech.torlando.lxst.core
 
+import android.media.AudioDeviceInfo
 import app.cash.turbine.test
 import io.mockk.clearAllMocks
 import io.mockk.every
@@ -420,6 +421,33 @@ class CallCoordinatorTest {
 
                 cancelAndIgnoreRemainingEvents()
             }
+        }
+
+    @Test
+    fun `selecting an output device updates speaker state`() =
+        runTest {
+            every { mockCallManager.selectCallAudioDevice(2) } returns true
+            every { mockCallManager.availableCallAudioDevices() } returns
+                listOf(CallAudioDevice(2, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, "Speaker"))
+
+            assertTrue(callBridge.selectCallAudioDevice(2))
+            assertTrue(callBridge.isSpeakerOn.value)
+
+            every { mockCallManager.selectCallAudioDevice(1) } returns true
+            every { mockCallManager.availableCallAudioDevices() } returns
+                listOf(CallAudioDevice(1, AudioDeviceInfo.TYPE_BUILTIN_EARPIECE, "Earpiece"))
+
+            assertTrue(callBridge.selectCallAudioDevice(1))
+            assertFalse(callBridge.isSpeakerOn.value)
+        }
+
+    @Test
+    fun `rejected output device selection leaves speaker state alone`() =
+        runTest {
+            every { mockCallManager.selectCallAudioDevice(3) } returns false
+
+            assertFalse(callBridge.selectCallAudioDevice(3))
+            assertFalse(callBridge.isSpeakerOn.value)
         }
 
     // ========== Helper Method Tests ==========
